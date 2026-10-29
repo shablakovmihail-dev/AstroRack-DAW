@@ -269,6 +269,14 @@ class AstroRackWindow(QMainWindow):
         self.btn_export.setToolTip("Export Image (Ctrl+S)")
         self.btn_export.clicked.connect(self._export_image)
 
+        self.btn_batch = QPushButton("☷")
+        self.btn_batch.setFixedSize(36, 36)
+        self.btn_batch.setObjectName("toolIconBtn")
+        self.btn_batch.setEnabled(False)
+        self.btn_batch.setToolTip("Загрузите референсный снимок и настройте рэк для запуска пакетной обработки")
+        self.btn_batch.clicked.connect(self._open_batch_processor)
+        self.batch_btn = self.btn_batch
+
         self.btn_reset_image = QPushButton("✕")
         self.btn_reset_image.setFixedSize(36, 36)
         self.btn_reset_image.setObjectName("btnResetImage")
@@ -277,6 +285,7 @@ class AstroRackWindow(QMainWindow):
 
         top_bar.addWidget(self.btn_open)
         top_bar.addWidget(self.btn_export)
+        top_bar.addWidget(self.btn_batch)
         top_bar.addWidget(self.btn_reset_image)
         top_bar.addSpacing(6)
         top_bar.addWidget(create_v_divider())
@@ -962,6 +971,7 @@ class AstroRackWindow(QMainWindow):
         """Регистрация горячих клавиш для инструментов и управления приложением."""
         QShortcut(QKeySequence("Ctrl+O"), self, self._open_file_dialog)
         QShortcut(QKeySequence("Ctrl+S"), self, self._export_image)
+        QShortcut(QKeySequence("Ctrl+B"), self, self._open_batch_processor)
         QShortcut(QKeySequence("Ctrl+Z"), self, self._on_undo_clicked)
         QShortcut(QKeySequence("Ctrl+Y"), self, self._on_redo_clicked)
         QShortcut(QKeySequence("Z"), self, lambda: self.toolbox.toggle_tool("loupe"))
@@ -1028,6 +1038,7 @@ class AstroRackWindow(QMainWindow):
                 <tr><td><b>Space (Пробел)</b></td><td>Master Bypass (мгновенное сравнение До/После)</td></tr>
                 <tr><td><b>Ctrl + O</b></td><td>Открыть изображение (Open Image)</td></tr>
                 <tr><td><b>Ctrl + S</b></td><td>Экспортировать результат (Export Image)</td></tr>
+                <tr><td><b>Ctrl + B</b></td><td>Пакетная обработка кадров (Batch Process)</td></tr>
                 <tr><td><b>Ctrl + Z</b></td><td>Отменить действие (Undo)</td></tr>
                 <tr><td><b>Ctrl + Y</b></td><td>Повторить действие (Redo)</td></tr>
                 <tr><td><b>F1</b></td><td>Открыть справку по горячим клавишам</td></tr>
@@ -1225,6 +1236,7 @@ class AstroRackWindow(QMainWindow):
         tool_btns = [
             getattr(self, 'btn_open', None),
             getattr(self, 'btn_export', None),
+            getattr(self, 'btn_batch', None),
             getattr(self, 'btn_split_view', None),
             getattr(self, 'btn_invert_split', None),
             getattr(self, 'btn_split_orient', None),
@@ -1482,6 +1494,14 @@ class AstroRackWindow(QMainWindow):
         ]:
             if btn is not None:
                 btn.setEnabled(has_image)
+
+        # Кнопка пакетной обработки кадров (Batch Process)
+        if hasattr(self, 'btn_batch') and self.btn_batch is not None:
+            self.btn_batch.setEnabled(has_image)
+            if has_image:
+                self.btn_batch.setToolTip("Применить текущий профиль рэка к серии файлов... (Ctrl+B)")
+            else:
+                self.btn_batch.setToolTip("Загрузите референсный снимок и настройте рэк для запуска пакетной обработки")
 
         # Undo / Redo
         if hasattr(self, 'history') and self.history is not None:
@@ -1960,6 +1980,49 @@ class AstroRackWindow(QMainWindow):
                 QMessageBox.critical(self, "Export Error", "Не удалось кодировать изображение.")
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Ошибка записи файла:\n{str(e)}")
+
+    def _open_batch_processor(self):
+        """Открывает диалог настройки и запуска пакетной обработки серии кадров."""
+        if self._raw_image is None or getattr(self._raw_image, 'size', 0) == 0:
+            return
+
+        from ui.batch_processor import BatchSetupDialog, BatchProgressDialog
+
+        # 1. Захват актуального снапшота параметров рэка
+        rack_state = self._get_current_state_dict()
+
+        # 2. Получение фиксированных сдвигов RGB (если есть в кэше)
+        fixed_shifts = (0.0, 0.0, 0.0, 0.0)
+        if hasattr(self.worker, '_cache_rgb_align') and self.worker._cache_rgb_align is not None:
+            fixed_shifts = self.worker._cache_rgb_align[1]
+
+        # 3. Получение активной области кропа
+        crop_rect = None
+        if hasattr(self.canvas, '_crop_mode') and self.canvas._crop_mode and self.canvas._crop_item is not None:
+            r = self.canvas._crop_item.crop_rect.normalized()
+            crop_rect = (int(round(r.left())), int(round(r.top())), int(round(r.right())), int(round(r.bottom())))
+
+        default_dir = self._last_open_dir or self._last_save_dir
+
+        setup_dialog = BatchSetupDialog(
+            parent=self,
+            rack_state=rack_state,
+            default_dir=default_dir,
+            fixed_shifts=fixed_shifts,
+            reference_crop_rect=crop_rect
+        )
+
+        if setup_dialog.exec() == QDialog.DialogCode.Accepted:
+            config = setup_dialog.get_configuration()
+            progress_dialog = BatchProgressDialog(
+                parent=self,
+                file_paths=config['files'],
+                rack_state=rack_state,
+                batch_options=config
+            )
+            progress_dialog.exec()
+
+    open_batch_processing = _open_batch_processor
 
     def _is_dragging_slider(self) -> bool:
         return bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
