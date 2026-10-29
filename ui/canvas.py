@@ -1,5 +1,7 @@
 #"""Холст AstroCanvas: интерактивный Split View, лупа 300% (Alt), кадрирование и профилометр."""
 import os
+import math
+import traceback
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF, QTimer, QPoint, QRect
@@ -13,6 +15,13 @@ from PyQt6.QtGui import (
     QRadialGradient, QLinearGradient
 )
 from .widgets import THEMES
+from .measurement_hud import MeasurementHUD, MeasurementBottomBar
+from core.geometry_calc import (
+    circle_from_3_points,
+    fit_circle_3points,
+    calculate_spherical_correction,
+    calculate_crater_ellipse
+)
 from utils.file_io import get_resource_path
 
 
@@ -514,6 +523,7 @@ class AstroCanvas(QGraphicsView):
     zoomChanged = pyqtSignal(str)
     psfPointClicked = pyqtSignal(QPointF)
     rulerMeasured = pyqtSignal(float, float, str)
+    rulerSubmodeChanged = pyqtSignal(str)
     fileDropped = pyqtSignal(str)
     openFileDialogRequested = pyqtSignal()
     pixelProbeChanged = pyqtSignal(str, str)
@@ -555,7 +565,63 @@ class AstroCanvas(QGraphicsView):
         self._ruler_dragging = False
         self._telescope_focal_len = 1000.0
         self._telescope_pixel_size = 3.76
+        self._lunar_distance_km = 384400.0
         self._ruler_unit = "all"
+
+        # Служебные структуры для диска Луны и эллипса кратера (с защитой состояния)
+        self.disk_points = []
+        self.three_points = self.disk_points
+        self.three_points_result = None
+        self.disk_center = None
+        self.disk_radius = 0.0
+        self.is_drawing_disk = False
+        self.ellipse_center = None
+        self.ellipse_a = 0.0
+        self.ellipse_b = 0.0
+        self.ellipse_angle = 0.0
+        self.ellipse_stage = 0  # 0: idle, 1: defining primary axis, 2: defining secondary axis
+        self.ellipse_start = None
+        self.ellipse_end = None
+        self.active_mode = "ruler"  # "ruler", "moon_disk", "crater_ellipse"
+
+        # Сферическая привязка диска Луны и эллиптический замер кратеров
+        self._meas_submode = "ruler"  # "ruler" | "disk" | "ellipse"
+        self._disk_method = "center_radius"  # "center_radius" | "three_points"
+        self.calibrated_disk = None  # Tuple[float, float, float] (x0, y0, radius) или None
+
+        # Bounding Box привязки диска Луны (1:1 Drag from Corner)
+        self.disk_drag_start = None     # QPointF в координатах картинки
+        self.disk_drag_current = None   # QPointF в координатах картинки
+        self.disk_is_dragging = False   # зажата ли мышь
+        self._disk_rect_img = None      # QRectF рамки строго в координатах изображения
+        self.temp_disk_rect = None      # псевдоним для обратной совместимости
+        self.pending_disk = None        # (cx, cy, r)
+        self._disk_transform_mode = None  # "draw" | "move" | "resize" | None
+        self._disk_drag_start_pos = None
+        self._disk_drag_start_center = None
+        self._disk_drag_start_radius = 0.0
+
+        # Совместимость структур
+        self._disk_draft_center = None
+        self._disk_draft_radius = 0.0
+        self._disk_draft_dragging = False
+        self._disk_draft_drag_target = None  # "center" | "radius" | None
+        self._disk_points = self.disk_points
+        self._disk_state = "idle"
+        self._disk_draw_start = None
+        self._disk_active_handle = None
+        self._disk_drag_start_mouse = None
+        self._drag_start_center = None
+        self._drag_start_radius = 0.0
+        self._disk_anchor = None
+        self._disk_hover_handle = None
+
+        # Интерактивное состояние замера кратера (Two-stage Drag)
+        self._ellipse_step = 0  # 0: idle, 1: dragging major axis, 2: adjusting minor axis, 3: completed
+        self._ellipse_p_start = None
+        self._ellipse_p_end = None
+        self._ellipse_cursor = None
+        self._ellipse_data = None
 
         # Предвыделенные буферы для конвертации numpy -> QImage -> QPixmap без лишних копий
         self._raw_u8_buf = None
@@ -586,6 +652,14 @@ class AstroCanvas(QGraphicsView):
         self.status_overlay.setText("No image loaded")
         self.status_overlay.adjustSize()
         self.status_overlay.hide()
+
+        self.measurement_hud = MeasurementBottomBar()
+        self.measurement_hud.hide()
+        self.measurement_shelf = self.measurement_hud
+        self.measurement_hud.mode_changed.connect(self.set_measurement_submode)
+        self.measurement_hud.disk_method_changed.connect(self.set_disk_method)
+        self.measurement_hud.apply_alignment_requested.connect(self.apply_disk_alignment)
+        self.measurement_hud.reset_disk_requested.connect(self.reset_disk_alignment)
 
         self.welcome_widget = ZeroStateWidget(self.viewport())
         self.welcome_widget.fileSelected.connect(self.fileDropped.emit)
@@ -719,6 +793,11 @@ class AstroCanvas(QGraphicsView):
         super().resizeEvent(event)
         self._update_overlay_pos()
         self._update_welcome_pos()
+        self._update_measurement_hud_pos()
+
+    def _update_measurement_hud_pos(self):
+        # Панель измерений зафиксирована в нижней части контейнера под холстом
+        pass
 
     def _update_overlay_pos(self):
         if hasattr(self, 'status_overlay'):
@@ -883,15 +962,377 @@ class AstroCanvas(QGraphicsView):
         self._psf_mode = active
         self._update_interaction_state()
 
+    @property
+    def zoom_factor(self) -> float:
+        """Текущий коэффициент зума отображения кадра."""
+        return max(1e-4, float(self.transform().m11()))
+
+    @property
+    def pan_offset(self) -> QPointF:
+        """Текущее смещение панорамирования холста (QPointF)."""
+        t = self.transform()
+        return QPointF(t.dx(), t.dy())
+
+    def apply_view_transform(self, painter: QPainter):
+        """Применяет матрицу панорамирования и зума холста к QPainter."""
+        painter.setTransform(self.transform())
+
+    @property
+    def image_viewport_rect(self) -> QRectF:
+        """Экранные границы кадра с учетом отступов центрирования (letterbox) и зума."""
+        if getattr(self, '_custom_image_viewport_rect', None) is not None:
+            return self._custom_image_viewport_rect
+        pix = None
+        if hasattr(self, '_item') and self._item is not None:
+            if not self._item.processed_pixmap.isNull():
+                pix = self._item.processed_pixmap
+            elif not self._item.raw_pixmap.isNull():
+                pix = self._item.raw_pixmap
+        if pix is not None and not pix.isNull() and pix.width() > 0 and pix.height() > 0:
+            tl = self.mapFromScene(QPointF(0.0, 0.0))
+            zf = self.zoom_factor
+            return QRectF(tl.x(), tl.y(), pix.width() * zf, pix.height() * zf)
+        vp = self.viewport()
+        w = float(vp.width()) if vp else 800.0
+        h = float(vp.height()) if vp else 600.0
+        return QRectF(0.0, 0.0, w, h)
+
+    @image_viewport_rect.setter
+    def image_viewport_rect(self, val: Optional[QRectF]):
+        self._custom_image_viewport_rect = val
+
+    def screen_to_image(self, screen_pos: QPointF | QPoint) -> QPointF:
+        """Переводит координаты экрана/вьюпорта в пиксели изображения с учетом letterbox."""
+        rect = self.image_viewport_rect
+        zf = max(1e-4, self.zoom_factor)
+        pt = screen_pos.toPointF() if isinstance(screen_pos, QPoint) else screen_pos
+        img_x = (pt.x() - rect.left()) / zf
+        img_y = (pt.y() - rect.top()) / zf
+        if math.isnan(img_x) or math.isnan(img_y) or math.isinf(img_x) or math.isinf(img_y):
+            return QPointF(0.0, 0.0)
+        return QPointF(img_x, img_y)
+
+    def image_to_screen(self, img_pos: QPointF | QPoint) -> QPointF:
+        """Переводит пиксели исходного изображения в координаты экрана/вьюпорта."""
+        rect = self.image_viewport_rect
+        zf = self.zoom_factor
+        pt = img_pos.toPointF() if isinstance(img_pos, QPoint) else img_pos
+        screen_x = rect.left() + pt.x() * zf
+        screen_y = rect.top() + pt.y() * zf
+        return QPointF(screen_x, screen_y)
+
+    @property
+    def disk_rect_img(self) -> Optional[QRectF]:
+        """Координаты габаритной рамки диска Луны строго в пространстве изображения."""
+        return self._disk_rect_img
+
+    @disk_rect_img.setter
+    def disk_rect_img(self, val: Optional[QRectF]):
+        self._disk_rect_img = val
+
+    @property
+    def temp_disk_rect(self) -> Optional[QRectF]:
+        """Псевдоним для disk_rect_img для обратной совместимости."""
+        return self._disk_rect_img
+
+    @temp_disk_rect.setter
+    def temp_disk_rect(self, val: Optional[QRectF]):
+        self._disk_rect_img = val
+
+    @property
+    def p1_img(self) -> Optional[QPointF]:
+        """Точка 1 на дуге лимба в координатах изображения."""
+        pts = self.disk_points if len(self.disk_points) > 0 else self._disk_points
+        return pts[0] if len(pts) > 0 else None
+
+    @property
+    def p2_img(self) -> Optional[QPointF]:
+        """Точка 2 на дуге лимба в координатах изображения."""
+        pts = self.disk_points if len(self.disk_points) > 0 else self._disk_points
+        return pts[1] if len(pts) > 1 else None
+
+    @property
+    def p3_img(self) -> Optional[QPointF]:
+        """Точка 3 на дуге лимба в координатах изображения."""
+        pts = self.disk_points if len(self.disk_points) > 0 else self._disk_points
+        return pts[2] if len(pts) > 2 else None
+
+    @property
+    def _calibrated_disk(self):
+        return self.calibrated_disk
+
+    @_calibrated_disk.setter
+    def _calibrated_disk(self, val):
+        self.calibrated_disk = val
+
+    @property
+    def disk_mode(self) -> bool:
+        return self._ruler_mode and (self._meas_submode == "disk" or getattr(self, 'active_mode', '') == "moon_disk")
+
+    @disk_mode.setter
+    def disk_mode(self, val: bool):
+        if val:
+            self.set_ruler_mode(True)
+            self.set_measurement_submode("disk")
+        else:
+            if self._meas_submode == "disk":
+                self.set_measurement_submode("ruler")
+
+    def viewport_to_image_coords(self, pos: QPoint | QPointF) -> QPointF:
+        """Безопасный перевод экранных координат вьюпорта в пиксели кадра."""
+        return self.screen_to_image(pos)
+
     def set_ruler_mode(self, active: bool):
         self._ruler_mode = active
-        if not active:
+        if active:
+            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                self.measurement_hud.show()
+                self.measurement_hud.set_collapsed(False)
+                self._update_measurement_hud_pos()
+                if self._ruler_p1 is not None and self._ruler_p2 is not None and self._meas_submode == "ruler":
+                    self._emit_ruler_info()
+                elif self._ellipse_data is not None and self._meas_submode == "ellipse":
+                    d = self._ellipse_data
+                    self.measurement_hud.set_ellipse_results(
+                        d["true_diameter_km"], d["apparent_diameter_km"], d["tilt_deg"],
+                        d["cos_theta"], d["eccentricity"], d["semi_major_a"], d["semi_minor_b"]
+                    )
+        else:
             self._ruler_dragging = False
+            self.is_drawing_disk = False
+            self._disk_draft_dragging = False
+            self._disk_transform_mode = None
+            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                self.measurement_hud.hide()
         self._update_interaction_state()
+        self.viewport().update()
+
+    def set_measurement_submode(self, mode: str):
+        if mode in ("moon_disk", "disk"):
+            canonical = "disk"
+            self.active_mode = "moon_disk"
+        elif mode in ("crater_ellipse", "ellipse"):
+            canonical = "ellipse"
+            self.active_mode = "crater_ellipse"
+        else:
+            canonical = "ruler"
+            self.active_mode = "ruler"
+
+        self._meas_submode = canonical
+        if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+            self.measurement_hud.set_mode(canonical)
+        self.rulerSubmodeChanged.emit(canonical)
+        if canonical == "ruler":
+            self.set_status_text("Прямая линейка: зажмите ЛКМ и протяните отрезок (M)")
+            if self._ruler_p1 is not None and self._ruler_p2 is not None:
+                self._emit_ruler_info()
+            elif hasattr(self, 'measurement_hud'):
+                self.measurement_hud.clear_results()
+        elif canonical == "disk":
+            self.set_status_text("Привязка диска: растяните рамку 1:1 или укажите 3 точки на лимбе")
+            if hasattr(self, 'measurement_hud'):
+                self.measurement_hud.clear_results()
+        elif canonical == "ellipse":
+            self.set_status_text("Эллипс кратера: протяните максимальный поперечник (вал), затем растяните малую ось")
+            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                self.measurement_hud.set_ellipse_step(self.ellipse_stage if self.ellipse_stage > 0 else 1)
+            if self._ellipse_data is not None and hasattr(self, 'measurement_hud'):
+                d = self._ellipse_data
+                self.measurement_hud.set_ellipse_results(
+                    d["true_diameter_km"], d["apparent_diameter_km"], d["tilt_deg"],
+                    d["cos_theta"], d["eccentricity"], d["semi_major_a"], d["semi_minor_b"]
+                )
+            elif hasattr(self, 'measurement_hud'):
+                self.measurement_hud.clear_results()
+        self.viewport().update()
+
+    def _hit_test_disk_rect(self, img_pos: QPointF) -> Optional[str]:
+        """
+        Проверяет попадание точки в координатах изображения в маркеры трансформации диска.
+        Возвращает: 'tl', 'tr', 'br', 'bl', 'center' или None.
+        """
+        if img_pos is None:
+            return None
+
+        rect = self.temp_disk_rect
+        if rect is None:
+            c = self.disk_center if self.disk_center is not None else self._disk_draft_center
+            r = self.disk_radius if self.disk_radius > 0.0 else self._disk_draft_radius
+            if c is not None and r >= 5.0:
+                rect = QRectF(c.x() - r, c.y() - r, 2.0 * r, 2.0 * r)
+            else:
+                return None
+
+        if rect.width() < 5.0:
+            return None
+
+        zf = max(1e-4, getattr(self, 'zoom_factor', 1.0))
+        tol = 12.0 / zf
+
+        x = img_pos.x()
+        y = img_pos.y()
+
+        # 1. Проверка 4 угловых маркеров масштабирования (Resize Handles)
+        if abs(x - rect.left()) <= tol and abs(y - rect.top()) <= tol:
+            return "tl"
+        if abs(x - rect.right()) <= tol and abs(y - rect.top()) <= tol:
+            return "tr"
+        if abs(x - rect.right()) <= tol and abs(y - rect.bottom()) <= tol:
+            return "br"
+        if abs(x - rect.left()) <= tol and abs(y - rect.bottom()) <= tol:
+            return "bl"
+
+        # 2. Проверка границы окружности диска (Resize по периметру)
+        c = rect.center()
+        dist_to_c = math.hypot(x - c.x(), y - c.y())
+        radius = rect.width() / 2.0
+        if abs(dist_to_c - radius) <= tol:
+            return "edge"
+
+        # 3. Проверка перемещения центра (Move / Pan Center)
+        if dist_to_c < max(5.0, radius - tol):
+            return "center"
+
+        return None
+
+    def _hit_test_disk_handles(self, vp_pos: QPoint) -> Optional[str]:
+        """Возвращает имя маркера трансформации ('center', 'tl', 'tr', 'br', 'bl') или None."""
+        img_pos = self.viewport_to_image_coords(vp_pos)
+        return self._hit_test_disk_rect(img_pos)
+
+    def _cursor_for_disk_handle(self, handle: Optional[str]) -> Qt.CursorShape:
+        """Определяет форму курсора для Figma маркера трансформации."""
+        if handle == "center":
+            return Qt.CursorShape.SizeAllCursor
+        elif handle in ("tl", "br"):
+            return Qt.CursorShape.SizeFDiagCursor
+        elif handle in ("tr", "bl"):
+            return Qt.CursorShape.SizeBDiagCursor
+        elif handle == "edge":
+            return Qt.CursorShape.SizeAllCursor
+        return Qt.CursorShape.CrossCursor
+
+    def set_disk_method(self, method: str):
+        if getattr(self, '_in_disk_method_update', False):
+            return
+        self._in_disk_method_update = True
+        try:
+            self._disk_method = method
+            self.disk_points.clear()
+            if self._disk_points is not self.disk_points:
+                self._disk_points.clear()
+            if hasattr(self, 'three_points') and self.three_points is not self.disk_points:
+                self.three_points.clear()
+            self.three_points_result = None
+            self.disk_center = None
+            self._disk_draft_center = None
+            self.disk_radius = 0.0
+            self._disk_draft_radius = 0.0
+            self.temp_disk_rect = None
+            self.pending_disk = None
+            self._disk_state = "idle"
+            self._disk_active_handle = None
+            self._disk_hover_handle = None
+            self.is_drawing_disk = False
+            self._disk_draft_dragging = False
+            self._disk_transform_mode = None
+            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                self.measurement_hud.btn_apply_disk.setEnabled(False)
+                if self.measurement_hud._disk_method != method:
+                    self.measurement_hud.set_disk_method(method)
+            if method == "three_points":
+                self.set_status_text("Привязка диска: укажите 3 точки на дуге лимба Луны")
+            else:
+                self.set_status_text("Привязка диска: растяните рамку 1:1 по лимбу Луны")
+            self.viewport().update()
+        finally:
+            self._in_disk_method_update = False
+
+    def apply_disk_alignment(self):
+        if self.pending_disk is not None:
+            self.calibrated_disk = self.pending_disk
+        elif self.temp_disk_rect and self.temp_disk_rect.width() > 5:
+            c = self.temp_disk_rect.center()
+            r = self.temp_disk_rect.width() / 2.0
+            self.calibrated_disk = (c.x(), c.y(), r)
+        elif self._disk_method == "center_radius":
+            center = self.disk_center if self.disk_center is not None else self._disk_draft_center
+            radius = self.disk_radius if self.disk_radius > 0.0 else self._disk_draft_radius
+            if center is not None and radius >= 5.0:
+                self.calibrated_disk = (center.x(), center.y(), radius)
+        elif self._disk_method == "three_points":
+            pts = self.disk_points if len(self.disk_points) == 3 else self._disk_points
+            if len(pts) == 3:
+                res = circle_from_3_points(pts[0], pts[1], pts[2])
+                if res is not None:
+                    c, r_disk = res
+                    self.calibrated_disk = (c.x(), c.y(), r_disk)
+
+        if self.calibrated_disk is not None:
+            x0, y0, r_disk = self.calibrated_disk
+            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                self.measurement_hud.set_disk_status(True, r_disk)
+            self.set_status_text(f"Диск Луны откалиброван: R={int(round(r_disk))} px. Режим: Линейка.")
+            self.temp_disk_rect = None
+            self.pending_disk = None
+            self.disk_is_dragging = False
+            self.disk_drag_start = None
+            self.disk_drag_current = None
+            self._disk_state = "idle"
+            self._disk_active_handle = None
+            self._disk_hover_handle = None
+            self._disk_draw_start = None
+            self._disk_anchor = None
+            self.disk_center = None
+            self._disk_draft_center = None
+            self.disk_radius = 0.0
+            self._disk_draft_radius = 0.0
+            self.disk_points.clear()
+            self._disk_points.clear()
+            # Автоматически переключаем инструмент обратно на линейку
+            self.set_measurement_submode("ruler")
+            self.viewport().update()
+
+    def reset_disk_alignment(self):
+        self.calibrated_disk = None
+        self.pending_disk = None
+        self.temp_disk_rect = None
+        self.disk_is_dragging = False
+        self.disk_drag_start = None
+        self.disk_drag_current = None
+        self._disk_state = "idle"
+        self._disk_active_handle = None
+        self._disk_hover_handle = None
+        self._disk_draw_start = None
+        self._disk_anchor = None
+        self.disk_center = None
+        self._disk_draft_center = None
+        self.disk_radius = 0.0
+        self._disk_draft_radius = 0.0
+        self.disk_points.clear()
+        if self._disk_points is not self.disk_points:
+            self._disk_points.clear()
+        if hasattr(self, 'three_points') and self.three_points is not self.disk_points:
+            self.three_points.clear()
+        self.three_points_result = None
+        if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+            self.measurement_hud.set_disk_status(False)
+            self.measurement_hud.set_disk_prompt("", can_apply=False)
+            self.measurement_hud.clear_results()
+        self.set_status_text("Калибровка диска Луны сброшена")
+        if self._ruler_p1 is not None and self._ruler_p2 is not None:
+            self._emit_ruler_info()
+        self.viewport().update()
 
     def set_telescope_params(self, focal_len_mm: float, pixel_size_um: float):
         self._telescope_focal_len = max(1.0, float(focal_len_mm))
         self._telescope_pixel_size = max(0.1, float(pixel_size_um))
+        if self._ruler_p1 is not None and self._ruler_p2 is not None:
+            self._emit_ruler_info()
+        self.viewport().update()
+
+    def set_lunar_distance(self, distance_km: float):
+        self._lunar_distance_km = max(100000.0, float(distance_km))
         if self._ruler_p1 is not None and self._ruler_p2 is not None:
             self._emit_ruler_info()
         self.viewport().update()
@@ -906,6 +1347,20 @@ class AstroCanvas(QGraphicsView):
         self._ruler_p1 = None
         self._ruler_p2 = None
         self._ruler_dragging = False
+        self.ellipse_stage = 0
+        self._ellipse_step = 0
+        self.ellipse_start = None
+        self._ellipse_p_start = None
+        self.ellipse_end = None
+        self._ellipse_p_end = None
+        self._ellipse_cursor = None
+        self._ellipse_data = None
+        self.ellipse_center = None
+        self.ellipse_a = 0.0
+        self.ellipse_b = 0.0
+        self.ellipse_angle = 0.0
+        if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+            self.measurement_hud.clear_results()
         self.viewport().update()
 
     def clear_psf_marker(self):
@@ -922,7 +1377,9 @@ class AstroCanvas(QGraphicsView):
         else:
             ang_str = f"{ang_arcsec / 3600.0:.2f}°"
 
-        km = ang_arcsec * 1.8636
+        lunar_dist = getattr(self, '_lunar_distance_km', 384400.0)
+        # Distance_km = (Pixels * (Pixel_Size_um / (Focal_Length_mm * 1000))) * Current_Moon_Distance_km
+        km = (dist_px * (self._telescope_pixel_size / (self._telescope_focal_len * 1000.0))) * lunar_dist
 
         unit = getattr(self, '_ruler_unit', 'all')
         if unit == 'px':
@@ -947,10 +1404,80 @@ class AstroCanvas(QGraphicsView):
         if abs(angle_deg) < 1e-4 or abs(angle_deg - 360.0) < 1e-4:
             angle_deg = 0.0
 
-        dist_str, _ = self._format_ruler_dist(dist_px)
-        summary = f"L: {dist_str} | Angle: {angle_deg:.1f}°"
+        dist_str, ang_str = self._format_ruler_dist(dist_px)
+
+        lunar_dist = getattr(self, '_lunar_distance_km', 384400.0)
+        scale_km_per_px = (self._telescope_pixel_size / (self._telescope_focal_len * 1000.0)) * lunar_dist
+        proj_km = dist_px * scale_km_per_px
+
+        true_km = None
+        tilt_deg = 0.0
+        cos_theta = 1.0
+
+        if self._calibrated_disk is not None:
+            x0, y0, r_disk = self._calibrated_disk
+            corr = calculate_spherical_correction(
+                (self._ruler_p1.x(), self._ruler_p1.y()),
+                (self._ruler_p2.x(), self._ruler_p2.y()),
+                (x0, y0),
+                r_disk,
+                scale_km_per_px
+            )
+            true_km = corr["true_km"]
+            tilt_deg = corr["tilt_deg"]
+            cos_theta = corr["cos_theta"]
+            if true_km is not None:
+                summary = f"Proj: {dist_str} | True: {true_km:.1f} km (θ={tilt_deg:.0f}°, cos θ={cos_theta:.2f}) | {angle_deg:.1f}°"
+            else:
+                summary = f"Proj: {dist_str} | True: N/A (Limb boundary) | {angle_deg:.1f}°"
+            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                self.measurement_hud.set_ruler_results(
+                    proj_km, ang_str, dist_px, true_km, tilt_deg, cos_theta, is_calibrated=True
+                )
+        else:
+            summary = f"L: {dist_str} | Angle: {angle_deg:.1f}°"
+            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                self.measurement_hud.set_ruler_results(
+                    proj_km, ang_str, dist_px, is_calibrated=False
+                )
+
         self.rulerMeasured.emit(dist_px, angle_deg, summary)
         self.set_status_text(f"Ruler: {summary}")
+
+    def _update_ellipse_calc(self, cursor_pos: QPointF):
+        p_start = self.ellipse_start if self.ellipse_start is not None else self._ellipse_p_start
+        p_end = self.ellipse_end if self.ellipse_end is not None else self._ellipse_p_end
+        if p_start is None or p_end is None:
+            return
+        dx = p_end.x() - p_start.x()
+        dy = p_end.y() - p_start.y()
+        dist_2a = math.hypot(dx, dy)
+        if dist_2a <= 1e-4:
+            return
+
+        p1 = (p_start.x(), p_start.y())
+        p2 = (p_end.x(), p_end.y())
+        p_cur = (cursor_pos.x(), cursor_pos.y())
+        lunar_dist = getattr(self, '_lunar_distance_km', 384400.0)
+        scale_km_per_px = (self._telescope_pixel_size / (self._telescope_focal_len * 1000.0)) * lunar_dist
+        try:
+            self._ellipse_data = calculate_crater_ellipse(
+                p1, p2, p_cur, scale_km_per_px
+            )
+        except Exception:
+            traceback.print_exc()
+            return
+
+        if self._ellipse_data and hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+            d = self._ellipse_data
+            self.ellipse_center = QPointF(d["center"][0], d["center"][1])
+            self.ellipse_a = d["semi_major_a"]
+            self.ellipse_b = d["semi_minor_b"]
+            self.ellipse_angle = d["angle_deg"]
+            self.measurement_hud.set_ellipse_results(
+                d["true_diameter_km"], d["apparent_diameter_km"], d["tilt_deg"],
+                d["cos_theta"], d["eccentricity"], d["semi_major_a"], d["semi_minor_b"]
+            )
 
     def apply_current_crop(self):
         if self._crop_mode and self._crop_item is not None:
@@ -1091,8 +1618,196 @@ class AstroCanvas(QGraphicsView):
             painter.drawLine(QPointF(cx, cy - r_ret - 4), QPointF(cx, cy - r_ret + 1))
             painter.drawLine(QPointF(cx, cy + r_ret - 1), QPointF(cx, cy + r_ret + 4))
 
-        # 2.2. Линейка расстояний и углов (Pixel / Angular Ruler)
-        if (self._ruler_mode or self._ruler_dragging) and self._ruler_p1 is not None and self._ruler_p2 is not None:
+        # 2.2.0 Отрисовка интерактивного диска Луны (Bounding Box) или откалиброванного ориентира
+        is_disk_submode = (self._meas_submode == "disk" or getattr(self, 'active_mode', '') == "moon_disk")
+        is_ruler_submode = (self._meas_submode == "ruler" or getattr(self, 'active_mode', '') == "ruler")
+        is_ellipse_submode = (self._meas_submode == "ellipse" or getattr(self, 'active_mode', '') == "crater_ellipse")
+
+        if self._ruler_mode and (is_disk_submode or (is_ruler_submode and self.calibrated_disk)):
+            try:
+                draw_rect = self.disk_rect_img or self.temp_disk_rect
+                if draw_rect is None and is_disk_submode and self.disk_center is not None and self.disk_radius > 5:
+                    r = self.disk_radius
+                    draw_rect = QRectF(self.disk_center.x() - r, self.disk_center.y() - r, 2.0 * r, 2.0 * r)
+                    self.disk_rect_img = draw_rect
+
+                if is_disk_submode and draw_rect and draw_rect.width() > 5:
+                    top_left_s = self.image_to_screen(draw_rect.topLeft())
+                    bottom_right_s = self.image_to_screen(draw_rect.bottomRight())
+                    screen_rect = QRectF(top_left_s, bottom_right_s).normalized()
+                    center_s = screen_rect.center()
+
+                    # Тонкая пунктирная рамка квадрата:
+                    pen_box = QPen(QColor(100, 120, 150, 140), 1.0, Qt.PenStyle.DashLine)
+                    painter.setPen(pen_box)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawRect(screen_rect)
+
+                    # 1. Окружность диска:
+                    pen_circle = QPen(QColor(0, 229, 255, 200), 2.0)
+                    painter.setPen(pen_circle)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawEllipse(screen_rect)
+
+                    # 2. Крестик центра (+):
+                    cr = 6.0
+                    painter.drawLine(QPointF(center_s.x() - cr, center_s.y()), QPointF(center_s.x() + cr, center_s.y()))
+                    painter.drawLine(QPointF(center_s.x(), center_s.y() - cr), QPointF(center_s.x(), center_s.y() + cr))
+
+                    # 3. 4 угловых маркера ресайза (белые квадратики с черной окантовкой):
+                    h_size = 8.0
+                    painter.setBrush(QBrush(QColor(255, 255, 255)))
+                    painter.setPen(QPen(QColor(0, 0, 0), 1.0))
+                    for pt in [screen_rect.topLeft(), screen_rect.topRight(),
+                               screen_rect.bottomLeft(), screen_rect.bottomRight()]:
+                        painter.drawRect(QRectF(pt.x() - h_size / 2.0, pt.y() - h_size / 2.0, h_size, h_size))
+
+                # Отрисовка уже откалиброванного статического диска (в режиме ruler тонкая линия 20% alpha):
+                elif is_ruler_submode and self.calibrated_disk:
+                    cx, cy, r = self.calibrated_disk
+                    center_s = self.image_to_screen(QPointF(cx, cy))
+                    r_s = r * self.zoom_factor
+                    pen_calib = QPen(QColor(0, 229, 255, 50), 1.5, Qt.PenStyle.DotLine)
+                    painter.setPen(pen_calib)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawEllipse(center_s, r_s, r_s)
+            except Exception:
+                traceback.print_exc()
+
+        if self._ruler_mode and is_disk_submode and self._disk_method == "three_points" and self.temp_disk_rect is None:
+            try:
+                pts = self.disk_points if len(self.disk_points) > 0 else self._disk_points
+                pt_pen = QPen(QColor("#00e5ff"), 2.0)
+                painter.setPen(pt_pen)
+                painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+                for i, pt in enumerate(pts):
+                    s_pt = self.image_to_screen(pt)
+                    painter.setBrush(QBrush(QColor("#00adb5")))
+                    painter.drawEllipse(s_pt, 5.0, 5.0)
+                    painter.setPen(QColor("#ffffff"))
+                    painter.drawText(QRectF(s_pt.x() + 7.0, s_pt.y() - 10.0, 30.0, 18.0), Qt.AlignmentFlag.AlignLeft, f"P{i+1}")
+                    painter.setPen(pt_pen)
+
+                # Превью окружности по 2 точкам + курсор или 3 точкам
+                pts_to_fit = list(pts)
+                if len(pts_to_fit) == 2 and hasattr(self, '_mouse_vp') and self._mouse_vp is not None:
+                    scene_cur = self.viewport_to_image_coords(self._mouse_vp.toPoint())
+                    d1 = float(np.hypot(scene_cur.x() - pts_to_fit[0].x(), scene_cur.y() - pts_to_fit[0].y()))
+                    d2 = float(np.hypot(scene_cur.x() - pts_to_fit[1].x(), scene_cur.y() - pts_to_fit[1].y()))
+                    if d1 > 15.0 and d2 > 15.0:
+                        pts_to_fit.append(scene_cur)
+
+                if len(pts_to_fit) == 3:
+                    c_fit = circle_from_3_points(pts_to_fit[0], pts_to_fit[1], pts_to_fit[2])
+                    if c_fit is not None:
+                        center, r = c_fit
+                        if r > 1.0:
+                            center_s = self.image_to_screen(center)
+                            r_s = r * self.zoom_factor
+                            style = Qt.PenStyle.DashLine if len(pts) < 3 else Qt.PenStyle.SolidLine
+                            c_pen = QPen(QColor("#00e5ff"), 1.8, style)
+                            painter.setPen(c_pen)
+                            painter.setBrush(Qt.BrushStyle.NoBrush)
+                            painter.drawEllipse(center_s, r_s, r_s)
+            except Exception:
+                traceback.print_exc()
+
+        # 2.2.2 Замер кратера эллиптическим инструментом (Crater Ellipse)
+        p_start = self.ellipse_start if self.ellipse_start is not None else self._ellipse_p_start
+        p_end = self.ellipse_end if self.ellipse_end is not None else self._ellipse_p_end
+        stage = self.ellipse_stage if self.ellipse_stage > 0 else self._ellipse_step
+
+        if self._ruler_mode and is_ellipse_submode and p_start is not None:
+            try:
+                painter.save()
+                view_scale = max(1e-4, self.transform().m11())
+                p1_vp = self.mapFromScene(p_start)
+
+                if stage == 1 and p_end is not None:
+                    p2_vp = self.mapFromScene(p_end)
+                    if not (math.isnan(p1_vp.x()) or math.isnan(p1_vp.y()) or math.isnan(p2_vp.x()) or math.isnan(p2_vp.y())):
+                        axis_pen = QPen(QColor("#00e5ff"), 1.8)
+                        axis_pen.setCosmetic(True)
+                        painter.setPen(axis_pen)
+                        painter.drawLine(p1_vp, p2_vp)
+                        painter.setBrush(QBrush(QColor("#00e5ff")))
+                        painter.drawEllipse(p1_vp, 3.5, 3.5)
+                        painter.drawEllipse(p2_vp, 3.5, 3.5)
+
+                elif stage in (2, 3) and self._ellipse_data is not None:
+                    d = self._ellipse_data
+                    xc, yc = d["center"]
+                    a = self.ellipse_a if self.ellipse_a > 0.0 else d["semi_major_a"]
+                    b = self.ellipse_b if self.ellipse_b > 0.0 else d["semi_minor_b"]
+                    angle_deg = self.ellipse_angle if self.ellipse_angle != 0.0 else d["angle_deg"]
+                    true_km = d["true_diameter_km"]
+                    apparent_km = d["apparent_diameter_km"]
+                    tilt_deg = d["tilt_deg"]
+                    cos_theta = d["cos_theta"]
+
+                    # Рисовать эллипс только если a > 1.0 and b > 0.5; исключить передачу NaN/Inf в rotate и drawEllipse
+                    if (a > 1.0 and b > 0.5 and
+                        not (math.isnan(xc) or math.isnan(yc) or math.isnan(a) or math.isnan(b) or
+                             math.isnan(angle_deg) or math.isinf(a) or math.isinf(b) or math.isinf(angle_deg))):
+
+                        vc = self.mapFromScene(QPointF(xc, yc))
+                        a_vp = a * view_scale
+                        b_vp = b * view_scale
+
+                        if not (math.isnan(vc.x()) or math.isnan(vc.y()) or math.isinf(vc.x()) or math.isinf(vc.y())):
+                            painter.save()
+                            painter.translate(vc.x(), vc.y())
+                            painter.rotate(angle_deg)
+
+                            # Полупрозрачная заливка кратера
+                            painter.setBrush(QBrush(QColor(0, 229, 255, 35)))
+                            ell_pen = QPen(QColor("#00e5ff"), 2.0)
+                            ell_pen.setCosmetic(True)
+                            painter.setPen(ell_pen)
+                            painter.drawEllipse(QPointF(0, 0), a_vp, b_vp)
+
+                            # Главная ось со засечками
+                            major_pen = QPen(QColor("#00e5ff"), 1.6)
+                            major_pen.setCosmetic(True)
+                            painter.setPen(major_pen)
+                            painter.drawLine(QPointF(-a_vp, 0), QPointF(a_vp, 0))
+                            painter.drawLine(QPointF(-a_vp, -5), QPointF(-a_vp, 5))
+                            painter.drawLine(QPointF(a_vp, -5), QPointF(a_vp, 5))
+
+                            # Малая ось (пунктир)
+                            minor_pen = QPen(QColor("#38bdf8"), 1.2, Qt.PenStyle.DashLine)
+                            minor_pen.setCosmetic(True)
+                            painter.setPen(minor_pen)
+                            painter.drawLine(QPointF(0, -b_vp), QPointF(0, b_vp))
+                            painter.restore()
+
+                            # Плашка результатов рядом с эллипсом с защитой от вылета за границы экрана
+                            badge_text = f"True Dia: {true_km:.1f} km | Apparent: {apparent_km:.1f} km | Tilt: {tilt_deg:.0f}° (cos θ = {cos_theta:.2f})"
+                            badge_x = vc.x() + a_vp + 12.0
+                            badge_y = vc.y() - b_vp - 10.0
+
+                            painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+                            fm = painter.fontMetrics()
+                            bw = fm.horizontalAdvance(badge_text) + 12
+                            bh = fm.height() + 6
+
+                            # Viewport boundary clamping
+                            badge_x = max(10.0, min(badge_x, float(vp_w) - bw - 10.0))
+                            badge_y = max(10.0, min(badge_y, float(vp_h) - bh - 10.0))
+                            b_rect = QRectF(badge_x, badge_y, bw, bh)
+
+                            painter.setPen(QPen(QColor("#00e5ff"), 1))
+                            painter.setBrush(QBrush(QColor(18, 18, 26, 230)))
+                            painter.drawRoundedRect(b_rect, 5, 5)
+                            painter.setPen(QColor("#e2e8f0"))
+                            painter.drawText(b_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+
+                painter.restore()
+            except Exception:
+                traceback.print_exc()
+
+        # 2.2.3 Линейка расстояний и углов (Pixel / Angular / Spherical Ruler)
+        if (self._ruler_mode or self._ruler_dragging) and is_ruler_submode and self._ruler_p1 is not None and self._ruler_p2 is not None:
             vp1 = QPointF(self.mapFromScene(self._ruler_p1))
             vp2 = QPointF(self.mapFromScene(self._ruler_p2))
             dx = self._ruler_p2.x() - self._ruler_p1.x()
@@ -1126,7 +1841,25 @@ class AstroCanvas(QGraphicsView):
             painter.drawEllipse(vp2, 2.5, 2.5)
 
             dist_str, _ = self._format_ruler_dist(dist_px)
-            badge_text = f"L: {dist_str} | {angle_deg:.1f}°"
+
+            if self._calibrated_disk is not None:
+                x0, y0, r_disk = self._calibrated_disk
+                lunar_dist = getattr(self, '_lunar_distance_km', 384400.0)
+                scale_km_per_px = (self._telescope_pixel_size / (self._telescope_focal_len * 1000.0)) * lunar_dist
+                corr = calculate_spherical_correction(
+                    (self._ruler_p1.x(), self._ruler_p1.y()),
+                    (self._ruler_p2.x(), self._ruler_p2.y()),
+                    (x0, y0),
+                    r_disk,
+                    scale_km_per_px
+                )
+                if corr["true_km"] is not None:
+                    badge_text = f"Proj: {dist_str} | True: {corr['true_km']:.1f} km (θ={corr['tilt_deg']:.0f}°)"
+                else:
+                    badge_text = f"Proj: {dist_str} | True: N/A (Limb boundary)"
+            else:
+                badge_text = f"L: {dist_str} | {angle_deg:.1f}°"
+
             mid_x = (vp1.x() + vp2.x()) / 2.0
             mid_y = (vp1.y() + vp2.y()) / 2.0
             if v_len > 1.0:
@@ -1140,7 +1873,13 @@ class AstroCanvas(QGraphicsView):
             fm = painter.fontMetrics()
             bw = fm.horizontalAdvance(badge_text) + 12
             bh = fm.height() + 6
-            b_rect = QRectF(badge_x - bw / 2.0, badge_y - bh / 2.0, bw, bh)
+            bx = badge_x - bw / 2.0
+            by = badge_y - bh / 2.0
+
+            # Viewport boundary clamping
+            bx = max(10.0, min(bx, float(vp_w) - bw - 10.0))
+            by = max(10.0, min(by, float(vp_h) - bh - 10.0))
+            b_rect = QRectF(bx, by, bw, bh)
 
             painter.setPen(QPen(QColor("#e5a93b"), 1))
             painter.setBrush(QBrush(QColor(18, 18, 26, 225)))
@@ -1263,7 +2002,9 @@ class AstroCanvas(QGraphicsView):
 
     def mousePressEvent(self, event):
         self._sync_alt_state(event.modifiers())
-        scene_pos = self.mapToScene(event.pos())
+        pos = event.pos()
+        img_pos = self.viewport_to_image_coords(pos)
+        scene_pos = img_pos if img_pos is not None else self.mapToScene(pos)
 
         if self._loupe_mode and event.button() == Qt.MouseButton.LeftButton:
             self.viewport().update()
@@ -1278,13 +2019,202 @@ class AstroCanvas(QGraphicsView):
             return
 
         if self._ruler_mode and event.button() == Qt.MouseButton.LeftButton:
-            self._ruler_dragging = True
-            self._ruler_p1 = scene_pos
-            self._ruler_p2 = scene_pos
-            self._emit_ruler_info()
-            self.viewport().update()
-            event.accept()
-            return
+            if img_pos is None:
+                # Клик вне допустимой рабочей области изображения
+                return
+
+            try:
+                mode = self._meas_submode
+                if mode == "ruler":
+                    self._ruler_dragging = True
+                    self._ruler_p1 = img_pos
+                    self._ruler_p2 = img_pos
+                    self._emit_ruler_info()
+                    self.viewport().update()
+                    event.accept()
+                    return
+
+                elif mode == "disk" or getattr(self, 'active_mode', '') == "moon_disk":
+                    img_coords = self.viewport_to_image_coords(event.pos())
+                    if img_coords is None:
+                        return
+
+                    has_existing_disk = (
+                        (self.temp_disk_rect is not None and self.temp_disk_rect.width() > 5.0) or
+                        (self.disk_center is not None and self.disk_radius >= 5.0)
+                    )
+                    if has_existing_disk:
+                        handle = self._hit_test_disk_handles(event.pos())
+                        if handle in ("tl", "tr", "br", "bl", "edge"):
+                            self._disk_transform_mode = "resize"
+                            self._disk_active_handle = handle
+                            self._disk_drag_start_pos = img_coords
+                            rect = self.temp_disk_rect
+                            if rect is None:
+                                r = self.disk_radius
+                                rect = QRectF(self.disk_center.x() - r, self.disk_center.y() - r, 2 * r, 2 * r)
+                                self.temp_disk_rect = rect
+                            self._disk_drag_start_center = rect.center()
+                            self._disk_drag_start_radius = rect.width() / 2.0
+                            self.disk_is_dragging = True
+                            self.set_status_text("Масштабирование диска: тяните курсор для изменения радиуса.")
+                            self.viewport().update()
+                            event.accept()
+                            return
+
+                        elif handle == "center":
+                            self._disk_transform_mode = "move"
+                            self._disk_active_handle = "center"
+                            self._disk_drag_start_pos = img_coords
+                            rect = self.temp_disk_rect
+                            if rect is None:
+                                r = self.disk_radius
+                                rect = QRectF(self.disk_center.x() - r, self.disk_center.y() - r, 2 * r, 2 * r)
+                                self.temp_disk_rect = rect
+                            self._disk_drag_start_center = rect.center()
+                            self._disk_drag_start_radius = rect.width() / 2.0
+                            self.disk_is_dragging = True
+                            self.set_status_text("Перемещение диска: перетащите диск в новое положение.")
+                            self.viewport().update()
+                            event.accept()
+                            return
+
+                        else:
+                            # Клик снаружи диска и маркеров: сброс текущего диска и построение с нуля!
+                            self.temp_disk_rect = None
+                            self.pending_disk = None
+                            self.disk_center = None
+                            self.disk_radius = 0.0
+                            self._disk_draft_center = None
+                            self._disk_draft_radius = 0.0
+                            self.disk_points.clear()
+                            if self._disk_points is not self.disk_points:
+                                self._disk_points.clear()
+                            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                                self.measurement_hud.set_disk_prompt("", can_apply=False)
+
+                    if self._disk_method == "center_radius":
+                        # Старт построения нового диска с нуля
+                        self._disk_transform_mode = "draw"
+                        self._disk_active_handle = None
+                        self.disk_drag_start = img_coords
+                        self.disk_drag_current = self.disk_drag_start
+                        self.disk_is_dragging = True
+                        self.is_drawing_disk = True
+                        self._disk_draft_dragging = True
+                        self.temp_disk_rect = None
+                        self.pending_disk = None
+                        self.disk_center = self.disk_drag_start
+                        self.disk_radius = 0.0
+                        self.set_status_text("Привязка диска: растяните рамку 1:1 по лимбу Луны")
+                        self.viewport().update()
+                        event.accept()
+                        return
+
+                    elif self._disk_method == "three_points":
+                        if len(self.disk_points) >= 3:
+                            self.disk_points.clear()
+                            if self._disk_points is not self.disk_points:
+                                self._disk_points.clear()
+                            self.disk_center = None
+                            self._disk_draft_center = None
+                            self.disk_radius = 0.0
+                            self._disk_draft_radius = 0.0
+                            self.temp_disk_rect = None
+                            self.pending_disk = None
+
+                        # Безопасно добавляем точку в список
+                        self.disk_points.append(img_coords)
+                        if self._disk_points is not self.disk_points:
+                            self._disk_points.append(img_coords)
+
+                        if len(self.disk_points) == 1:
+                            self.set_status_text("Точка 1 лимба установлена. Укажите точку 2 на дуге лимба.")
+                            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                                self.measurement_hud.set_disk_prompt("Точка 1 лимба установлена", can_apply=False)
+                        elif len(self.disk_points) == 2:
+                            self.set_status_text("Точка 2 лимба установлена. Укажите точку 3 на дуге лимба.")
+                            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                                self.measurement_hud.set_disk_prompt("Точка 2 лимба установлена", can_apply=False)
+                        elif len(self.disk_points) == 3:
+                            # Строгое условие: вызывать расчет только когда len == 3!
+                            res = circle_from_3_points(self.disk_points[0], self.disk_points[1], self.disk_points[2])
+                            if res is None:
+                                self.set_status_text("Внимание: 3 точки коллинеарны (на одной прямой). Выберите точку 3 в другом месте дуги.")
+                                self.disk_points.pop()
+                                if self._disk_points and self._disk_points is not self.disk_points:
+                                    self._disk_points.pop()
+                            else:
+                                center, r_disk = res
+                                x0, y0 = center.x(), center.y()
+                                self.disk_center = center
+                                self._disk_draft_center = self.disk_center
+                                self.disk_radius = r_disk
+                                self._disk_draft_radius = r_disk
+                                self.temp_disk_rect = QRectF(x0 - r_disk, y0 - r_disk, 2.0 * r_disk, 2.0 * r_disk)
+                                self.pending_disk = (x0, y0, r_disk)
+                                self.disk_rect_img = self.temp_disk_rect
+
+                                # Полностью очистить массив 3 точек и сбросить промежуточный результат:
+                                self.disk_points.clear()
+                                if self._disk_points is not self.disk_points:
+                                    self._disk_points.clear()
+                                if hasattr(self, 'three_points') and self.three_points is not self.disk_points:
+                                    self.three_points.clear()
+                                self.three_points_result = None
+
+                                if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                                    self.measurement_hud.set_disk_prompt(f"Окружность построена (R={r_disk:.0f} px)", can_apply=True)
+                                self.set_status_text(f"Окружность построена (R={r_disk:.0f} px). Нажмите [✓] или Enter.")
+
+                        self.viewport().update()
+                        event.accept()
+                        return
+
+                elif mode == "ellipse" or getattr(self, 'active_mode', '') == "crater_ellipse":
+                    stage = self.ellipse_stage if self.ellipse_stage in (0, 1, 2, 3) else self._ellipse_step
+                    if stage in (0, 3):
+                        self.ellipse_stage = 1
+                        self._ellipse_step = 1
+                        self.ellipse_start = img_pos
+                        self._ellipse_p_start = img_pos
+                        self.ellipse_end = img_pos
+                        self._ellipse_p_end = img_pos
+                        self._ellipse_cursor = None
+                        self._ellipse_data = None
+                        self.ellipse_center = None
+                        self.ellipse_a = 0.0
+                        self.ellipse_b = 0.0
+                        self.ellipse_angle = 0.0
+                        if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                            self.measurement_hud.set_ellipse_step(1)
+                        self.set_status_text("Шаг 1: Растяните максимальный диаметр кратера вдоль вала.")
+                        self.viewport().update()
+                        event.accept()
+                        return
+                    elif stage == 2:
+                        self.ellipse_stage = 3
+                        self._ellipse_step = 3
+                        self._ellipse_cursor = img_pos
+                        # Не вызывать математику деления b / a, пока точки не определены и a <= 1e-4
+                        p_start = self.ellipse_start if self.ellipse_start is not None else self._ellipse_p_start
+                        p_end = self.ellipse_end if self.ellipse_end is not None else self._ellipse_p_end
+                        if p_start is not None and p_end is not None:
+                            dx = p_end.x() - p_start.x()
+                            dy = p_end.y() - p_start.y()
+                            if math.hypot(dx, dy) > 1e-4:
+                                self._update_ellipse_calc(img_pos)
+                        if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                            self.measurement_hud.set_ellipse_step(3)
+                        self.set_status_text("Эллипс зафиксирован. Кликните снова для нового замера.")
+                        self.viewport().update()
+                        event.accept()
+                        return
+
+            except Exception:
+                traceback.print_exc()
+                event.accept()
+                return
 
         if self._profile_mode and event.button() == Qt.MouseButton.LeftButton:
             self._profile_dragging = True
@@ -1338,12 +2268,100 @@ class AstroCanvas(QGraphicsView):
         if self._loupe_mode or self._alt_pressed:
             self.viewport().update()
 
-        if self._ruler_mode and self._ruler_dragging:
-            self._ruler_p2 = scene_pos
-            self._emit_ruler_info()
-            self.viewport().update()
-            event.accept()
-            return
+        try:
+            if self._ruler_mode:
+                if (self._meas_submode == "disk" or getattr(self, 'active_mode', '') == "moon_disk") and not self.is_drawing_disk and not self._disk_draft_dragging:
+                    handle = self._hit_test_disk_handles(event.pos())
+                    if handle != self._disk_hover_handle:
+                        self._disk_hover_handle = handle
+                        self.setCursor(self._cursor_for_disk_handle(handle))
+                        self.viewport().update()
+
+                if self._meas_submode == "ruler" and self._ruler_dragging:
+                    self._ruler_p2 = scene_pos
+                    self._emit_ruler_info()
+                    self.viewport().update()
+                    event.accept()
+                    return
+                elif self._meas_submode == "disk" or getattr(self, 'active_mode', '') == "moon_disk":
+                    if self.disk_is_dragging:
+                        img_coords = self.viewport_to_image_coords(event.pos())
+                        if img_coords is not None:
+                            if getattr(self, '_disk_transform_mode', None) == "move" and getattr(self, '_disk_drag_start_pos', None) is not None:
+                                delta = img_coords - self._disk_drag_start_pos
+                                new_c = self._disk_drag_start_center + delta
+                                r = self._disk_drag_start_radius
+                                self.disk_center = new_c
+                                self._disk_draft_center = new_c
+                                self.disk_radius = r
+                                self._disk_draft_radius = r
+                                self.temp_disk_rect = QRectF(new_c.x() - r, new_c.y() - r, 2 * r, 2 * r)
+                                self.pending_disk = (new_c.x(), new_c.y(), r)
+                                self.set_status_text(f"Перемещение диска: центр ({new_c.x():.0f}, {new_c.y():.0f})")
+                                self.viewport().update()
+                                event.accept()
+                                return
+
+                            elif getattr(self, '_disk_transform_mode', None) == "resize" and getattr(self, '_disk_drag_start_center', None) is not None:
+                                center = self._disk_drag_start_center
+                                new_radius = max(5.0, float(max(abs(img_coords.x() - center.x()), abs(img_coords.y() - center.y()))))
+                                self.disk_center = center
+                                self._disk_draft_center = center
+                                self.disk_radius = new_radius
+                                self._disk_draft_radius = new_radius
+                                self.disk_rect_img = QRectF(center.x() - new_radius, center.y() - new_radius, new_radius * 2.0, new_radius * 2.0)
+                                self.pending_disk = (center.x(), center.y(), new_radius)
+                                self.set_status_text(f"Масштабирование от центра: R={new_radius:.0f} px")
+                                self.viewport().update()
+                                event.accept()
+                                return
+
+                            elif (self.is_drawing_disk or self._disk_draft_dragging) and self.disk_drag_start is not None:
+                                self.disk_drag_current = img_coords
+                                p_start = self.disk_drag_start
+                                p_cur = self.disk_drag_current
+
+                                cx = (p_start.x() + p_cur.x()) / 2.0
+                                cy = (p_start.y() + p_cur.y()) / 2.0
+                                center = QPointF(cx, cy)
+                                radius = math.hypot(p_cur.x() - p_start.x(), p_cur.y() - p_start.y()) / 2.0
+
+                                self.temp_disk_rect = QRectF(cx - radius, cy - radius, 2.0 * radius, 2.0 * radius)
+                                self.disk_center = center
+                                self.disk_radius = radius
+                                self._disk_draft_center = center
+                                self._disk_draft_radius = radius
+                                self.pending_disk = (cx, cy, radius)
+                                self.disk_rect_img = self.temp_disk_rect
+                                self.set_status_text(f"Привязка диска по диаметру: D={2.0 * radius:.0f} px, R={radius:.0f} px. Отпустите ЛКМ для фиксации.")
+                                self.viewport().update()
+                                event.accept()
+                                return
+                    elif self._disk_method == "three_points" and len(self.disk_points) == 2:
+                        self.viewport().update()
+                elif self._meas_submode == "ellipse" or getattr(self, 'active_mode', '') == "crater_ellipse":
+                    stage = self.ellipse_stage if self.ellipse_stage in (1, 2) else self._ellipse_step
+                    if stage == 1:
+                        self.ellipse_end = scene_pos
+                        self._ellipse_p_end = scene_pos
+                        p_start = self.ellipse_start if self.ellipse_start is not None else self._ellipse_p_start
+                        if p_start is not None:
+                            dx = self.ellipse_end.x() - p_start.x()
+                            dy = self.ellipse_end.y() - p_start.y()
+                            self.ellipse_a = math.hypot(dx, dy) / 2.0
+                            self.ellipse_angle = (math.degrees(math.atan2(dy, dx))) % 360.0
+                        self.viewport().update()
+                        event.accept()
+                        return
+                    elif stage == 2:
+                        self._ellipse_cursor = scene_pos
+                        if self.ellipse_a > 1e-4:
+                            self._update_ellipse_calc(scene_pos)
+                        self.viewport().update()
+                        event.accept()
+                        return
+        except Exception:
+            traceback.print_exc()
 
         if self._profile_mode and self._profile_dragging:
             self._profile_p2 = scene_pos
@@ -1415,6 +2433,46 @@ class AstroCanvas(QGraphicsView):
         if self._item.split_active and self._is_near_split_line(scene_pos):
             cursor = Qt.CursorShape.SplitHCursor if self._item.split_orientation == "Vertical" else Qt.CursorShape.SplitVCursor
             self.viewport().setCursor(cursor)
+        elif self._ruler_mode and (self._meas_submode == "disk" or getattr(self, 'active_mode', '') == "moon_disk") and not self.disk_is_dragging:
+            has_existing = (
+                self.temp_disk_rect is not None and self.temp_disk_rect.width() > 5.0 and
+                self.disk_center is not None and self.disk_radius >= 5.0
+            )
+            if has_existing:
+                view_scale = max(1e-4, self.transform().m11())
+                c_vp = self.mapFromScene(self.disk_center)
+                r_vp = self.disk_radius * view_scale
+                vp_pos = event.pos()
+                d_vp = math.hypot(vp_pos.x() - c_vp.x(), vp_pos.y() - c_vp.y())
+
+                tol_corner = 12.0
+                tl_vp = QPointF(c_vp.x() - r_vp, c_vp.y() - r_vp)
+                tr_vp = QPointF(c_vp.x() + r_vp, c_vp.y() - r_vp)
+                br_vp = QPointF(c_vp.x() + r_vp, c_vp.y() + r_vp)
+                bl_vp = QPointF(c_vp.x() - r_vp, c_vp.y() + r_vp)
+
+                if math.hypot(vp_pos.x() - tl_vp.x(), vp_pos.y() - tl_vp.y()) <= tol_corner or math.hypot(vp_pos.x() - br_vp.x(), vp_pos.y() - br_vp.y()) <= tol_corner:
+                    self.viewport().setCursor(Qt.CursorShape.SizeFDiagCursor)
+                elif math.hypot(vp_pos.x() - tr_vp.x(), vp_pos.y() - tr_vp.y()) <= tol_corner or math.hypot(vp_pos.x() - bl_vp.x(), vp_pos.y() - bl_vp.y()) <= tol_corner:
+                    self.viewport().setCursor(Qt.CursorShape.SizeBDiagCursor)
+                elif abs(d_vp - r_vp) <= 10.0:
+                    dx = vp_pos.x() - c_vp.x()
+                    dy = vp_pos.y() - c_vp.y()
+                    ang = abs(math.degrees(math.atan2(dy, dx)))
+                    if ang <= 25 or ang >= 155:
+                        self.viewport().setCursor(Qt.CursorShape.SizeHorCursor)
+                    elif 65 <= ang <= 115:
+                        self.viewport().setCursor(Qt.CursorShape.SizeVerCursor)
+                    elif (25 < ang < 65 and dx * dy > 0) or (115 < ang < 155 and dx * dy > 0):
+                        self.viewport().setCursor(Qt.CursorShape.SizeFDiagCursor)
+                    else:
+                        self.viewport().setCursor(Qt.CursorShape.SizeBDiagCursor)
+                elif d_vp < r_vp - 10.0:
+                    self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
+                else:
+                    self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.viewport().setCursor(Qt.CursorShape.CrossCursor)
         elif self._any_tool_active():
             self.viewport().setCursor(Qt.CursorShape.CrossCursor)
         else:
@@ -1423,13 +2481,92 @@ class AstroCanvas(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if self._ruler_mode and self._ruler_dragging:
-            self._ruler_dragging = False
-            self._ruler_p2 = scene_pos if 'scene_pos' in locals() else self.mapToScene(event.pos())
-            self._emit_ruler_info()
-            self.viewport().update()
-            event.accept()
-            return
+        scene_pos = self.mapToScene(event.pos())
+        try:
+            if self._ruler_mode:
+                if self._meas_submode == "ruler" and self._ruler_dragging:
+                    self._ruler_dragging = False
+                    self._ruler_p2 = scene_pos
+                    self._emit_ruler_info()
+                    self.viewport().update()
+                    event.accept()
+                    return
+                elif self._meas_submode == "disk" or getattr(self, 'active_mode', '') == "moon_disk":
+                    if self.disk_is_dragging or self.is_drawing_disk or self._disk_draft_dragging:
+                        self.disk_is_dragging = False
+                        self.is_drawing_disk = False
+                        self._disk_draft_dragging = False
+                        self._disk_draft_drag_target = None
+                        self._disk_active_handle = None
+                        self._disk_transform_mode = None
+                        if self.temp_disk_rect and self.temp_disk_rect.width() > 5:
+                            c = self.temp_disk_rect.center()
+                            r = self.temp_disk_rect.width() / 2.0
+                            self.pending_disk = (c.x(), c.y(), r)
+                            self.disk_center = c
+                            self.disk_radius = r
+                            self._disk_draft_center = c
+                            self._disk_draft_radius = r
+                            self.set_status_text(f"Диск построен (R={r:.0f} px). Нажмите [✓] или Enter.")
+                            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                                self.measurement_hud.set_disk_prompt(f"Диск построен (R={r:.0f} px)", can_apply=True)
+                        elif self.disk_center is not None and self.disk_radius > 5:
+                            c = self.disk_center
+                            r = self.disk_radius
+                            self.pending_disk = (c.x(), c.y(), r)
+                            self.temp_disk_rect = QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r)
+                            self.set_status_text(f"Диск построен (R={r:.0f} px). Нажмите [✓] или Enter.")
+                            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                                self.measurement_hud.set_disk_prompt(f"Диск построен (R={r:.0f} px)", can_apply=True)
+                        else:
+                            self.temp_disk_rect = None
+                            self.pending_disk = None
+                            self.disk_center = None
+                            self.disk_radius = 0.0
+                            self._disk_draft_center = None
+                            self._disk_draft_radius = 0.0
+                            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                                self.measurement_hud.set_disk_prompt("", can_apply=False)
+                            self.disk_radius = 0.0
+                            self._disk_draft_center = None
+                            self._disk_draft_radius = 0.0
+                        self.viewport().update()
+                        event.accept()
+                        return
+                elif self._meas_submode == "ellipse" or getattr(self, 'active_mode', '') == "crater_ellipse":
+                    stage = self.ellipse_stage if self.ellipse_stage in (1, 2) else self._ellipse_step
+                    if stage == 1:
+                        p_start = self.ellipse_start if self.ellipse_start is not None else self._ellipse_p_start
+                        p_end = self.ellipse_end if self.ellipse_end is not None else self._ellipse_p_end
+                        if p_start is not None and p_end is not None:
+                            dx = p_end.x() - p_start.x()
+                            dy = p_end.y() - p_start.y()
+                            dist = np.hypot(dx, dy)
+                            if dist >= 3.0:
+                                self.ellipse_stage = 2
+                                self._ellipse_step = 2
+                                self.ellipse_a = dist / 2.0
+                                self._ellipse_cursor = scene_pos
+                                self._update_ellipse_calc(scene_pos)
+                                if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                                    self.measurement_hud.set_ellipse_step(2)
+                                self.set_status_text("Шаг 2: Перемещайте курсор для задания малой оси. Кликните ЛКМ для фиксации.")
+                            else:
+                                self.ellipse_stage = 0
+                                self._ellipse_step = 0
+                                self.ellipse_start = None
+                                self._ellipse_p_start = None
+                                self.ellipse_end = None
+                                self._ellipse_p_end = None
+                                self.ellipse_a = 0.0
+                                self.ellipse_b = 0.0
+                                if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                                    self.measurement_hud.set_ellipse_step(1)
+                        self.viewport().update()
+                        event.accept()
+                        return
+        except Exception:
+            traceback.print_exc()
 
         if self._profile_mode and self._profile_dragging:
             self._profile_dragging = False
@@ -1450,12 +2587,68 @@ class AstroCanvas(QGraphicsView):
 
         super().mouseReleaseEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        if self._ruler_mode and self._meas_submode == "disk" and event.button() == Qt.MouseButton.LeftButton:
+            self.apply_disk_alignment()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Alt:
             self._alt_pressed = True
             self.viewport().update()
 
         if event.key() == Qt.Key.Key_Escape:
+            if self._ruler_mode:
+                if (self._meas_submode == "disk" or getattr(self, 'active_mode', '') == "moon_disk") and (
+                    self.disk_center is not None or self.temp_disk_rect is not None or self.pending_disk is not None or self._disk_draft_center is not None or self.disk_points or self._disk_points
+                ):
+                    self.disk_center = None
+                    self._disk_draft_center = None
+                    self.disk_radius = 0.0
+                    self._disk_draft_radius = 0.0
+                    self.temp_disk_rect = None
+                    self.pending_disk = None
+                    self.disk_is_dragging = False
+                    self.disk_drag_start = None
+                    self.disk_drag_current = None
+                    self._disk_state = "idle"
+                    self._disk_active_handle = None
+                    self._disk_hover_handle = None
+                    self._disk_draw_start = None
+                    self._disk_anchor = None
+                    self.disk_points.clear()
+                    if self._disk_points is not self.disk_points:
+                        self._disk_points.clear()
+                    self.is_drawing_disk = False
+                    self._disk_draft_dragging = False
+                    self.set_status_text("Черновик привязки диска сброшен.")
+                    self.viewport().update()
+                    event.accept()
+                    return
+                elif (self._meas_submode == "ellipse" or getattr(self, 'active_mode', '') == "crater_ellipse") and (
+                    self.ellipse_stage > 0 or self._ellipse_step > 0
+                ):
+                    self.ellipse_stage = 0
+                    self._ellipse_step = 0
+                    self.ellipse_start = None
+                    self._ellipse_p_start = None
+                    self.ellipse_end = None
+                    self._ellipse_p_end = None
+                    self._ellipse_cursor = None
+                    self._ellipse_data = None
+                    self.ellipse_center = None
+                    self.ellipse_a = 0.0
+                    self.ellipse_b = 0.0
+                    self.ellipse_angle = 0.0
+                    if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                        self.measurement_hud.clear_results()
+                    self.set_status_text("Замер эллипса кратера отменён.")
+                    self.viewport().update()
+                    event.accept()
+                    return
+
             self.reset_to_default_tool()
             self.clear_ruler()
             self.clear_psf_marker()
@@ -1463,8 +2656,77 @@ class AstroCanvas(QGraphicsView):
             event.accept()
             return
 
-        if self._crop_mode:
-            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+        if self._ruler_mode and (self._meas_submode == "disk" or getattr(self, 'active_mode', '') == "moon_disk"):
+            center = self.disk_center if self.disk_center is not None else self._disk_draft_center
+            radius = self.disk_radius if self.disk_radius > 0.0 else self._disk_draft_radius
+
+            if center is not None and radius >= 5.0:
+                shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                move_step = 10.0 if shift else 1.0
+                rad_step = 5.0 if shift else 1.0
+
+                if event.key() == Qt.Key.Key_Left:
+                    self.disk_center = QPointF(center.x() - move_step, center.y())
+                    self._disk_draft_center = self.disk_center
+                    self.pending_disk = (self.disk_center.x(), self.disk_center.y(), radius)
+                    self.temp_disk_rect = QRectF(self.disk_center.x() - radius, self.disk_center.y() - radius, 2 * radius, 2 * radius)
+                    self.viewport().update()
+                    event.accept()
+                    return
+                elif event.key() == Qt.Key.Key_Right:
+                    self.disk_center = QPointF(center.x() + move_step, center.y())
+                    self._disk_draft_center = self.disk_center
+                    self.pending_disk = (self.disk_center.x(), self.disk_center.y(), radius)
+                    self.temp_disk_rect = QRectF(self.disk_center.x() - radius, self.disk_center.y() - radius, 2 * radius, 2 * radius)
+                    self.viewport().update()
+                    event.accept()
+                    return
+                elif event.key() == Qt.Key.Key_Up:
+                    self.disk_center = QPointF(center.x(), center.y() - move_step)
+                    self._disk_draft_center = self.disk_center
+                    self.pending_disk = (self.disk_center.x(), self.disk_center.y(), radius)
+                    self.temp_disk_rect = QRectF(self.disk_center.x() - radius, self.disk_center.y() - radius, 2 * radius, 2 * radius)
+                    self.viewport().update()
+                    event.accept()
+                    return
+                elif event.key() == Qt.Key.Key_Down:
+                    self.disk_center = QPointF(center.x(), center.y() + move_step)
+                    self._disk_draft_center = self.disk_center
+                    self.pending_disk = (self.disk_center.x(), self.disk_center.y(), radius)
+                    self.temp_disk_rect = QRectF(self.disk_center.x() - radius, self.disk_center.y() - radius, 2 * radius, 2 * radius)
+                    self.viewport().update()
+                    event.accept()
+                    return
+                elif event.key() in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+                    new_r = radius + rad_step
+                    self.disk_radius = new_r
+                    self._disk_draft_radius = new_r
+                    self.pending_disk = (center.x(), center.y(), new_r)
+                    self.temp_disk_rect = QRectF(center.x() - new_r, center.y() - new_r, 2 * new_r, 2 * new_r)
+                    self.set_status_text(f"Радиус диска: {new_r:.0f} px")
+                    self.viewport().update()
+                    event.accept()
+                    return
+                elif event.key() in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+                    new_r = max(5.0, radius - rad_step)
+                    self.disk_radius = new_r
+                    self._disk_draft_radius = new_r
+                    self.pending_disk = (center.x(), center.y(), new_r)
+                    self.temp_disk_rect = QRectF(center.x() - new_r, center.y() - new_r, 2 * new_r, 2 * new_r)
+                    self.set_status_text(f"Радиус диска: {new_r:.0f} px")
+                    self.viewport().update()
+                    event.accept()
+                    return
+
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._ruler_mode and (self._meas_submode == "disk" or getattr(self, 'active_mode', '') == "moon_disk"):
+                radius = self.disk_radius if self.disk_radius > 0.0 else self._disk_draft_radius
+                pts = self.disk_points if len(self.disk_points) > 0 else self._disk_points
+                if radius >= 5.0 or len(pts) == 3:
+                    self.apply_disk_alignment()
+                    event.accept()
+                    return
+            if self._crop_mode:
                 self.apply_current_crop()
                 event.accept()
                 return
@@ -1477,6 +2739,22 @@ class AstroCanvas(QGraphicsView):
         super().keyReleaseEvent(event)
 
     def wheelEvent(self, event):
+        center = self.disk_center if self.disk_center is not None else self._disk_draft_center
+        radius = self.disk_radius if self.disk_radius > 0.0 else self._disk_draft_radius
+        ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+
+        if self._ruler_mode and (self._meas_submode == "disk" or getattr(self, 'active_mode', '') == "moon_disk") and center is not None and radius >= 5.0 and ctrl:
+            delta = 1.0 if event.angleDelta().y() > 0 else -1.0
+            new_r = max(5.0, radius + delta * 1.0)
+            self.disk_radius = new_r
+            self._disk_draft_radius = new_r
+            self.set_status_text(f"Радиус диска: {new_r:.1f} px")
+            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                self.measurement_hud.set_disk_prompt(f"Диск R={new_r:.0f} px. Enter — применить", can_apply=True)
+            self.viewport().update()
+            event.accept()
+            return
+
         factor = 1.15 if event.angleDelta().y() > 0 else (1.0 / 1.15)
         self.scale(factor, factor)
         self.zoomChanged.emit(self.get_current_zoom_str())

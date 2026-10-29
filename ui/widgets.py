@@ -1,10 +1,12 @@
 #"""Специализированные виджеты: PlanetarySlider, CollapsibleInsertBox, HelpIcon, AstroParamRow."""
+import datetime
+from typing import Optional, Union, Callable
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRectF, QTimer, QObject, QEvent
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRectF, QTimer, QObject, QEvent, QDate
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QLabel, QSlider, QCheckBox, QPushButton, QDialog,
-    QToolButton, QDoubleSpinBox, QVBoxLayout, QHBoxLayout, QMessageBox, QComboBox,
+    QToolButton, QDoubleSpinBox, QDateEdit, QRadioButton, QVBoxLayout, QHBoxLayout, QMessageBox, QComboBox,
     QMenu, QToolTip,
     QStyledItemDelegate,
     QSizePolicy, QButtonGroup
@@ -14,6 +16,7 @@ from PyQt6.QtGui import (
     QLinearGradient, QRadialGradient
 )
 from core.processing import AstroEngine
+from core.lunar_distance import calculate_lunar_distance, DEFAULT_LUNAR_DISTANCE_KM
 
 THEMES = {
     'A': {
@@ -2726,24 +2729,54 @@ class PsfInspectorDialog(QDialog):
 
 
 class TelescopeOpticsDialog(QDialog):
-    """Диалог настройки оптических параметров телескопа для угловой линейки."""
+    """
+    Диалог настройки оптических параметров телескопа и компенсации эллиптической
+    орбиты Луны (расчёт расстояния до Земли по Меёсу / ELP-2000 или вручную).
+    """
 
-    def __init__(self, focal_len: float, pixel_size: float, parent=None):
+    params_preview = pyqtSignal(float, float, float)  # focal_len, pixel_size, moon_distance
+
+    def __init__(
+        self,
+        focal_len: float,
+        pixel_size: float,
+        parent=None,
+        moon_distance_km: float = DEFAULT_LUNAR_DISTANCE_KM,
+        lunar_mode: str = "date",
+        capture_date: Optional[Union[datetime.date, datetime.datetime]] = None,
+        is_auto_detected: bool = False,
+        on_preview_update: Optional[Callable[[float, float, float], None]] = None
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Параметры оптики / Telescope Scale")
-        self.setFixedWidth(320)
+        self.setWindowTitle("Калибровка линейки и оптики телескопа / Telescope & Lunar Scale")
+        self.setFixedWidth(380)
+
+        self._preview_callback = on_preview_update
+        self._is_auto_detected = bool(is_auto_detected)
+        self._initial_focal_len = float(focal_len)
+        self._initial_pixel_size = float(pixel_size)
+        self._initial_moon_dist = float(moon_distance_km)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        lbl_desc = QLabel("Задайте параметры оптики для пересчёта пикселей линейки в угловые секунды (arcsec):")
+        lbl_desc = QLabel("Задайте параметры оптики телескопа и лунной дистанции для калибровки линейки:")
         lbl_desc.setWordWrap(True)
         lbl_desc.setStyleSheet("color: #a0a0b0; font-size: 11px;")
         layout.addWidget(lbl_desc)
 
-        form = QVBoxLayout()
-        form.setSpacing(8)
+        # ---------------- 1. Блок параметров оптики ----------------
+        box_optics = QFrame()
+        box_optics.setObjectName("opticsCard")
+        box_optics.setStyleSheet("QFrame#opticsCard { background-color: #1a1c24; border: 1px solid #2e384d; border-radius: 6px; padding: 10px; }")
+        layout_optics = QVBoxLayout(box_optics)
+        layout_optics.setContentsMargins(10, 10, 10, 10)
+        layout_optics.setSpacing(8)
+
+        lbl_opt_title = QLabel("🔭 Оптика телескопа (Telescope Optics)")
+        lbl_opt_title.setStyleSheet("color: #00e5ff; font-weight: bold; font-size: 11px;")
+        layout_optics.addWidget(lbl_opt_title)
 
         row1 = QHBoxLayout()
         lbl_f = QLabel("Фокусное расстояние (F, мм):")
@@ -2752,12 +2785,12 @@ class TelescopeOpticsDialog(QDialog):
         self.spin_f.setRange(20.0, 20000.0)
         self.spin_f.setSingleStep(50.0)
         self.spin_f.setValue(focal_len)
-        self.spin_f.setFixedWidth(90)
+        self.spin_f.setFixedWidth(95)
         self.spin_f.setStyleSheet("background-color: #1e1e28; color: #00fff2; border: 1px solid #363648; border-radius: 4px;")
         row1.addWidget(lbl_f)
         row1.addStretch()
         row1.addWidget(self.spin_f)
-        form.addLayout(row1)
+        layout_optics.addLayout(row1)
 
         row2 = QHBoxLayout()
         lbl_p = QLabel("Размер пикселя матрицы (µm):")
@@ -2767,27 +2800,123 @@ class TelescopeOpticsDialog(QDialog):
         self.spin_p.setSingleStep(0.1)
         self.spin_p.setDecimals(2)
         self.spin_p.setValue(pixel_size)
-        self.spin_p.setFixedWidth(90)
+        self.spin_p.setFixedWidth(95)
         self.spin_p.setStyleSheet("background-color: #1e1e28; color: #00fff2; border: 1px solid #363648; border-radius: 4px;")
         row2.addWidget(lbl_p)
         row2.addStretch()
         row2.addWidget(self.spin_p)
-        form.addLayout(row2)
-        layout.addLayout(form)
+        layout_optics.addLayout(row2)
 
         self.lbl_scale = QLabel()
-        self.lbl_scale.setStyleSheet("color: #e5a93b; font-weight: bold; font-size: 11px; margin-top: 4px;")
+        self.lbl_scale.setStyleSheet("color: #e5a93b; font-weight: bold; font-size: 11px; margin-top: 2px;")
         self._update_scale_label()
-        self.spin_f.valueChanged.connect(self._update_scale_label)
-        self.spin_p.valueChanged.connect(self._update_scale_label)
-        layout.addWidget(self.lbl_scale)
+        layout_optics.addWidget(self.lbl_scale)
 
+        layout.addWidget(box_optics)
+
+        # ---------------- 2. Блок лунной калибровки (Distance to Moon) ----------------
+        box_lunar = QFrame()
+        box_lunar.setObjectName("lunarCard")
+        box_lunar.setStyleSheet("QFrame#lunarCard { background-color: #1a1c24; border: 1px solid #2e384d; border-radius: 6px; padding: 10px; }")
+        layout_lunar = QVBoxLayout(box_lunar)
+        layout_lunar.setContentsMargins(10, 10, 10, 10)
+        layout_lunar.setSpacing(8)
+
+        lbl_lunar_title = QLabel("🌙 Дистанция до Луны (Distance to Moon)")
+        lbl_lunar_title.setStyleSheet("color: #00e5ff; font-weight: bold; font-size: 11px;")
+        layout_lunar.addWidget(lbl_lunar_title)
+
+        # Переключатель режима (QRadioButton)
+        row_modes = QHBoxLayout()
+        self.mode_group = QButtonGroup(self)
+        self.radio_by_date = QRadioButton("По дате съёмки")
+        self.radio_manual = QRadioButton("Вручную в км")
+        self.mode_group.addButton(self.radio_by_date)
+        self.mode_group.addButton(self.radio_manual)
+        row_modes.addWidget(self.radio_by_date)
+        row_modes.addWidget(self.radio_manual)
+        row_modes.addStretch()
+        layout_lunar.addLayout(row_modes)
+
+        # Поле ввода даты съёмки + бейдж автоопределения EXIF
+        row_date = QHBoxLayout()
+        lbl_date = QLabel("Дата съёмки (UTC):")
+        lbl_date.setStyleSheet("color: #dcdce6; font-size: 11px;")
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_edit.setFixedWidth(105)
+
+        # Инициализация даты
+        if capture_date is not None:
+            if isinstance(capture_date, (datetime.datetime, datetime.date)):
+                qd = QDate(capture_date.year, capture_date.month, capture_date.day)
+            else:
+                qd = QDate.currentDate()
+        else:
+            qd = QDate.currentDate()
+        self.date_edit.setDate(qd)
+
+        self.lbl_badge = QLabel("EXIF Auto-detected")
+        self.lbl_badge.setStyleSheet(
+            "background-color: #14532d; color: #4ade80; border: 1px solid #22c55e; "
+            "border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 9px;"
+        )
+
+        row_date.addWidget(lbl_date)
+        row_date.addWidget(self.date_edit)
+        row_date.addWidget(self.lbl_badge)
+        row_date.addStretch()
+        layout_lunar.addLayout(row_date)
+
+        # Поле ввода / отображения расстояния
+        row_dist = QHBoxLayout()
+        lbl_dist = QLabel("Расстояние до Луны:")
+        lbl_dist.setStyleSheet("color: #dcdce6; font-size: 11px;")
+        self.distance_spinbox = QDoubleSpinBox()
+        self.distance_spinbox.setRange(350000.0, 420000.0)
+        self.distance_spinbox.setSingleStep(100.0)
+        self.distance_spinbox.setDecimals(1)
+        self.distance_spinbox.setSuffix(" km")
+        self.distance_spinbox.setFixedWidth(120)
+        self.distance_spinbox.setValue(moon_distance_km)
+        row_dist.addWidget(lbl_dist)
+        row_dist.addStretch()
+        row_dist.addWidget(self.distance_spinbox)
+        layout_lunar.addLayout(row_dist)
+
+        self.lbl_lunar_hint = QLabel("Расчёт по теории Меёса (ELP-2000). Перигей ~363 300 км | Апогей ~405 500 км")
+        self.lbl_lunar_hint.setWordWrap(True)
+        self.lbl_lunar_hint.setStyleSheet("color: #718096; font-size: 10px; margin-top: 2px;")
+        layout_lunar.addWidget(self.lbl_lunar_hint)
+
+        layout.addWidget(box_lunar)
+
+        # ---------------- 3. Кнопки сохранения и отмены ----------------
         btn_box = QHBoxLayout()
-        btn_box.addStretch()
+        self.btn_cancel = QPushButton("Отмена")
+        self.btn_cancel.setObjectName("btn_cancel")
+        self.btn_cancel.clicked.connect(self.reject)
         self.btn_ok = QPushButton("Сохранить")
         self.btn_ok.clicked.connect(self.accept)
+        btn_box.addStretch()
+        btn_box.addWidget(self.btn_cancel)
         btn_box.addWidget(self.btn_ok)
         layout.addLayout(btn_box)
+
+        # Подключение сигналов
+        self.spin_f.valueChanged.connect(self._on_optics_changed)
+        self.spin_p.valueChanged.connect(self._on_optics_changed)
+        self.radio_by_date.toggled.connect(self._on_mode_changed)
+        self.date_edit.dateChanged.connect(self._on_date_changed)
+        self.distance_spinbox.valueChanged.connect(self._on_distance_changed)
+
+        # Установка исходного режима
+        if lunar_mode == "manual":
+            self.radio_manual.setChecked(True)
+        else:
+            self.radio_by_date.setChecked(True)
+        self._update_ui_state()
 
         self.setStyleSheet("""
             QDialog {
@@ -2799,6 +2928,43 @@ class TelescopeOpticsDialog(QDialog):
                 background: transparent;
                 border: none;
                 font-family: 'Segoe UI', Arial, sans-serif;
+            }
+            QDoubleSpinBox, QDateEdit {
+                background-color: #1e1e28;
+                color: #00fff2;
+                border: 1px solid #363648;
+                border-radius: 4px;
+                padding: 3px 6px;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 11px;
+            }
+            QDoubleSpinBox:focus, QDateEdit:focus {
+                border: 1px solid #00fff2;
+            }
+            QDoubleSpinBox:disabled, QDateEdit:disabled {
+                background-color: #12141a;
+                color: #64748b;
+                border: 1px solid #232733;
+            }
+            QRadioButton {
+                color: #dcdce6;
+                font-size: 11px;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                spacing: 6px;
+            }
+            QRadioButton::indicator {
+                width: 14px;
+                height: 14px;
+                border-radius: 7px;
+                border: 1px solid #4a5568;
+                background-color: #1a1c24;
+            }
+            QRadioButton::indicator:hover {
+                border-color: #00fff2;
+            }
+            QRadioButton::indicator:checked {
+                border: 2px solid #00fff2;
+                background-color: #00fff2;
             }
             QPushButton {
                 background-color: #00adb5;
@@ -2816,6 +2982,37 @@ class TelescopeOpticsDialog(QDialog):
                 background-color: #00888f;
                 color: #ffffff;
             }
+            QPushButton#btn_cancel {
+                background-color: #2e384d;
+                color: #dcdce6;
+            }
+            QPushButton#btn_cancel:hover {
+                background-color: #3b4764;
+                color: #ffffff;
+            }
+            QCalendarWidget QWidget {
+                alternate-background-color: #1a1c24;
+                background-color: #16161e;
+                color: #dcdce6;
+            }
+            QCalendarWidget QAbstractItemView:enabled {
+                color: #dcdce6;
+                background-color: #16161e;
+                selection-background-color: #00adb5;
+                selection-color: #111114;
+            }
+            QCalendarWidget QToolButton {
+                color: #00fff2;
+                background-color: #1a1c24;
+            }
+            QCalendarWidget QMenu {
+                background-color: #1a1c24;
+                color: #dcdce6;
+            }
+            QCalendarWidget QSpinBox {
+                background-color: #1e1e28;
+                color: #00fff2;
+            }
         """)
 
     def _update_scale_label(self):
@@ -2824,8 +3021,79 @@ class TelescopeOpticsDialog(QDialog):
         scale = 206.265 * p / f
         self.lbl_scale.setText(f'Масштаб изображения: {scale:.2f} "/px')
 
+    def _on_optics_changed(self):
+        self._update_scale_label()
+        self._notify_preview()
+
+    def _on_mode_changed(self):
+        self._update_ui_state()
+        self._notify_preview()
+
+    def _update_ui_state(self):
+        by_date = self.radio_by_date.isChecked()
+        if by_date:
+            self.date_edit.setEnabled(True)
+            self.distance_spinbox.setEnabled(False)
+            if self._is_auto_detected:
+                self.lbl_badge.show()
+            else:
+                self.lbl_badge.hide()
+            # Пересчёт расстояния по текущей дате
+            self._recalculate_distance_from_date()
+        else:
+            self.date_edit.setEnabled(False)
+            self.distance_spinbox.setEnabled(True)
+            self.lbl_badge.hide()
+
+    def _recalculate_distance_from_date(self):
+        qd = self.date_edit.date()
+        py_d = datetime.date(qd.year(), qd.month(), qd.day())
+        dist = calculate_lunar_distance(py_d, round_digits=1)
+        self.distance_spinbox.blockSignals(True)
+        self.distance_spinbox.setValue(dist)
+        self.distance_spinbox.blockSignals(False)
+
+    def _on_date_changed(self):
+        if self.radio_by_date.isChecked():
+            self._recalculate_distance_from_date()
+            self._notify_preview()
+
+    def _on_distance_changed(self):
+        self._notify_preview()
+
+    def _notify_preview(self):
+        f = self.spin_f.value()
+        p = self.spin_p.value()
+        dist = self.distance_spinbox.value()
+        self.params_preview.emit(f, p, dist)
+        if self._preview_callback is not None:
+            try:
+                self._preview_callback(f, p, dist)
+            except Exception:
+                pass
+
+    def get_focal_len(self) -> float:
+        return float(self.spin_f.value())
+
+    def get_pixel_size(self) -> float:
+        return float(self.spin_p.value())
+
+    def get_moon_distance(self) -> float:
+        return float(self.distance_spinbox.value())
+
+    def get_lunar_mode(self) -> str:
+        return "date" if self.radio_by_date.isChecked() else "manual"
+
+    def get_capture_date(self) -> datetime.date:
+        qd = self.date_edit.date()
+        return datetime.date(qd.year(), qd.month(), qd.day())
+
+    def is_auto_detected(self) -> bool:
+        return self._is_auto_detected and self.radio_by_date.isChecked()
+
     def get_values(self):
-        return self.spin_f.value(), self.spin_p.value()
+        """Возвращает кортеж (f_mm, pixel_um, lunar_distance_km)."""
+        return self.spin_f.value(), self.spin_p.value(), self.distance_spinbox.value()
 
 
 class PhotoshopToolButton(QToolButton):
@@ -2916,6 +3184,7 @@ class ToolboxPanel(QFrame):
     ruler_unit_changed = pyqtSignal(str)
     ruler_optics_changed = pyqtSignal(float, float)
     ruler_optics_requested = pyqtSignal()
+    ruler_submode_changed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2974,7 +3243,9 @@ class ToolboxPanel(QFrame):
         self._loupe_zoom = 2.0
         self._ruler_focal_len = 1000.0
         self._ruler_pixel_size = 3.76
+        self._ruler_lunar_dist = DEFAULT_LUNAR_DISTANCE_KM
         self._ruler_unit = "all"
+        self._ruler_submode = "ruler"
         self._theme = THEMES['A']
 
         # 1. Loupe Button with Flyout
@@ -3153,6 +3424,23 @@ class ToolboxPanel(QFrame):
         menu = QMenu(self)
         menu.setStyleSheet(self._menu_qss())
 
+        # Режим измерений (Measurement Mode)
+        mode_menu = menu.addMenu("📐 Режим измерений (Mode)")
+        mode_menu.setStyleSheet(self._menu_qss())
+        meas_modes = [
+            ("📏 Прямая линейка (Linear Ruler)", "ruler"),
+            ("⭕ Привязка диска Луны (Moon Disk Alignment)", "disk"),
+            ("⬭ Эллипс кратера (Crater Ellipse)", "ellipse"),
+        ]
+        for label, m_key in meas_modes:
+            act = mode_menu.addAction(label)
+            act.setCheckable(True)
+            if getattr(self, '_ruler_submode', 'ruler') == m_key:
+                act.setChecked(True)
+            act.triggered.connect(lambda ch, m=m_key: self._set_ruler_submode(m))
+
+        menu.addSeparator()
+
         # Единицы измерения
         unit_menu = menu.addMenu("📏 Единицы измерения (Units)")
         unit_menu.setStyleSheet(self._menu_qss())
@@ -3208,10 +3496,26 @@ class ToolboxPanel(QFrame):
         act_custom_p.triggered.connect(self.ruler_optics_requested.emit)
 
         menu.addSeparator()
-        act_opt = menu.addAction("⚙ Настройки оптики телескопа...")
+        act_moon = menu.addAction(f"🌙 Расстояние до Луны ({self._ruler_lunar_dist:.0f} км)...")
+        act_moon.triggered.connect(self.ruler_optics_requested.emit)
+        act_opt = menu.addAction("⚙ Настройки оптики и калибровки...")
         act_opt.triggered.connect(self.ruler_optics_requested.emit)
 
         menu.exec(pos)
+
+    def set_lunar_distance(self, dist_km: float):
+        self._ruler_lunar_dist = float(dist_km)
+
+    def set_ruler_submode(self, mode: str):
+        self._ruler_submode = mode
+
+    def _set_ruler_submode(self, mode: str):
+        self._ruler_submode = mode
+        self.ruler_submode_changed.emit(mode)
+
+    def set_optics(self, f: float, p: float):
+        self._ruler_focal_len = float(f)
+        self._ruler_pixel_size = float(p)
 
     def _set_ruler_unit(self, unit: str):
         self._ruler_unit = unit

@@ -3,6 +3,7 @@ import os
 import time
 import json
 import traceback
+import datetime
 import numpy as np
 from scipy.ndimage import map_coordinates
 
@@ -25,6 +26,8 @@ from core.history import HistoryManager
 from core.processing import AstroEngine
 from core.pipeline import PipelineWorker
 from core.sound import sound_engine
+from core.metadata_reader import extract_capture_date
+from core.lunar_distance import calculate_lunar_distance, DEFAULT_LUNAR_DISTANCE_KM
 from .canvas import AstroCanvas
 from .monitors import MiniHistogramWidget, ProfileMonitor
 from .widgets import (
@@ -88,6 +91,10 @@ class AstroRackWindow(QMainWindow):
         self._profile_dialog = None
         self._psf_dialog = None
         self._optics_dialog = None
+        self._lunar_mode = "date"
+        self._lunar_capture_date = None
+        self._lunar_date_auto_detected = False
+        self._lunar_distance_km = DEFAULT_LUNAR_DISTANCE_KM
         self.history = HistoryManager(max_depth=50)
         self._last_dispatched_params = None
         self._render_start_time = 0.0
@@ -449,6 +456,8 @@ class AstroRackWindow(QMainWindow):
         self.toolbox.ruler_optics_requested.connect(self._show_optics_dialog)
         self.toolbox.ruler_optics_changed.connect(self.canvas.set_telescope_params)
         self.toolbox.ruler_unit_changed.connect(self.canvas.set_ruler_unit)
+        self.toolbox.ruler_submode_changed.connect(self._on_ruler_submode_changed)
+        self.canvas.rulerSubmodeChanged.connect(self.toolbox.set_ruler_submode)
         self.canvas.psfPointClicked.connect(self._on_psf_point_clicked)
         self.canvas.rulerMeasured.connect(self._on_ruler_measured)
         work_hbox.addWidget(self.toolbox)
@@ -456,8 +465,9 @@ class AstroRackWindow(QMainWindow):
         # 4. РАБОЧАЯ ОБЛАСТЬ: SPLITTER И ПАНЕЛЬ ИНСЕРТОВ
         # Правая панель (Insert Rack): тянущаяся через QSplitter со складной кнопкой слева
         self.rack_container = CollapsibleRackContainer()
-        self.rack_container.setMinimumWidth(340)
-        self.rack_container.setMaximumWidth(700)
+        self.rack_container.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.rack_container.setFixedWidth(340)
+        self.right_panel = self.rack_container
         rack_outer_hbox = QHBoxLayout(self.rack_container)
         rack_outer_hbox.setContentsMargins(0, 0, 0, 0)
         rack_outer_hbox.setSpacing(0)
@@ -631,14 +641,25 @@ class AstroRackWindow(QMainWindow):
 
         rack_outer_hbox.addWidget(self.rack_inner_widget)
 
+        # Контейнер холста и фиксированной нижней панели измерений
+        self.canvas_container = QWidget()
+        canvas_vbox = QVBoxLayout(self.canvas_container)
+        canvas_vbox.setContentsMargins(0, 0, 0, 0)
+        canvas_vbox.setSpacing(0)
+        self.measurement_shelf = self.canvas.measurement_hud
+        canvas_vbox.addWidget(self.canvas, stretch=1)
+        canvas_vbox.addWidget(self.measurement_shelf)
+
+        self.measurement_shelf.close_requested.connect(self._on_measurement_closed)
+
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.splitter.addWidget(self.canvas)
+        self.splitter.addWidget(self.canvas_container)
         self.splitter.addWidget(self.rack_container)
         self.splitter.setCollapsible(0, False)
         self.splitter.setCollapsible(1, False)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 0)
-        self.splitter.setSizes([1100, 380])
+        self.splitter.setSizes([1160, 340])
         self.splitter.splitterMoved.connect(self._on_splitter_moved)
 
         work_hbox.addWidget(self.splitter)
@@ -1139,10 +1160,9 @@ class AstroRackWindow(QMainWindow):
                 self.splitter.handle(1).setEnabled(False)
         else:
             self._panel_collapsed = False
-            self.rack_container.setMinimumWidth(340)
-            self.rack_container.setMaximumWidth(700)
+            self.rack_container.setFixedWidth(340)
             self.rack_inner_widget.setVisible(True)
-            self._set_panel_width(self._last_panel_width)
+            self._set_panel_width(340)
             self.btn_panel_toggle.setText("►")
             self.btn_panel_toggle.setToolTip("Свернуть панель настроек")
             if self.splitter.handle(1):
@@ -1608,9 +1628,16 @@ class AstroRackWindow(QMainWindow):
             self.lbl_status.setText("Кадрирование: потяните за рамку (C) — Enter: подтвердить, Esc: отмена")
         elif tool == "psf":
             self.lbl_status.setText("Инспектор PSF: кликните на звезду или кратер для измерения FWHM (P)")
-        elif tool == "ruler":
+        if tool == "ruler":
             self.lbl_status.setText("Линейка: зажмите ЛКМ и протяните линию (M). ПКМ по кнопке — оптика")
-        elif tool == "":
+            if hasattr(self, 'measurement_shelf') and self.measurement_shelf is not None:
+                self.measurement_shelf.setVisible(True)
+                self.measurement_shelf.set_collapsed(False)
+        else:
+            if hasattr(self, 'measurement_shelf') and self.measurement_shelf is not None:
+                self.measurement_shelf.setVisible(False)
+
+        if tool == "":
             self.lbl_status.setText(self._current_filename or "No image loaded")
 
     def _on_psf_point_clicked(self, pos: QPointF):
@@ -1652,16 +1679,57 @@ class AstroRackWindow(QMainWindow):
         self._record_current_state(f"Apply PSF σ={sigma:.2f} px")
 
     def _show_optics_dialog(self):
-        """Вызов диалога настройки оптики телескопа для линейки."""
-        dlg = TelescopeOpticsDialog(self.canvas._telescope_focal_len, self.canvas._telescope_pixel_size, self)
-        if dlg.exec():
-            f_mm, p_um = dlg.get_values()
+        """Вызов диалога настройки оптики телескопа и калибровки Луны."""
+        initial_f = self.canvas._telescope_focal_len
+        initial_p = self.canvas._telescope_pixel_size
+        initial_dist = getattr(self.canvas, '_lunar_distance_km', self._lunar_distance_km)
+
+        def on_preview(f_mm: float, p_um: float, dist_km: float):
             self.canvas.set_telescope_params(f_mm, p_um)
+            self.canvas.set_lunar_distance(dist_km)
+
+        dlg = TelescopeOpticsDialog(
+            focal_len=initial_f,
+            pixel_size=initial_p,
+            parent=self,
+            moon_distance_km=initial_dist,
+            lunar_mode=self._lunar_mode,
+            capture_date=self._lunar_capture_date,
+            is_auto_detected=self._lunar_date_auto_detected,
+            on_preview_update=on_preview
+        )
+        if dlg.exec():
+            vals = dlg.get_values()
+            f_mm, p_um = vals[0], vals[1]
+            dist_km = vals[2] if len(vals) > 2 else dlg.get_moon_distance()
+            self._lunar_mode = dlg.get_lunar_mode()
+            self._lunar_capture_date = dlg.get_capture_date()
+            self._lunar_date_auto_detected = dlg.is_auto_detected()
+            self._lunar_distance_km = dist_km
+            self.canvas.set_telescope_params(f_mm, p_um)
+            self.canvas.set_lunar_distance(dist_km)
+            self.toolbox.set_optics(f_mm, p_um)
+            self.toolbox.set_lunar_distance(dist_km)
             scale_val = 206.265 * p_um / f_mm
-            self.lbl_status.setText(f"Оптика: F={f_mm:.0f} мм, Pixel={p_um:.2f} µm ({scale_val:.2f} arcsec/px)")
+            self.lbl_status.setText(
+                f"Оптика: F={f_mm:.0f} мм, Pixel={p_um:.2f} µm ({scale_val:.2f} arcsec/px) | Луна: {dist_km:.1f} км"
+            )
+        else:
+            self.canvas.set_telescope_params(initial_f, initial_p)
+            self.canvas.set_lunar_distance(initial_dist)
 
     def _on_ruler_measured(self, dist: float, angle: float, summary: str):
         self.lbl_status.setText(f"Ruler: {summary} | Esc для сброса")
+
+    def _on_ruler_submode_changed(self, mode: str):
+        if not self.canvas._ruler_mode:
+            self.toolbox.toggle_tool("ruler")
+        self.canvas.set_measurement_submode(mode)
+
+    def _on_measurement_closed(self):
+        """Закрытие/сворачивание панели измерений."""
+        if hasattr(self, 'measurement_shelf') and self.measurement_shelf is not None:
+            self.measurement_shelf.set_collapsed(True)
 
     def _on_crop_cancelled(self):
         self._reset_active_tools()
@@ -1906,6 +1974,26 @@ class AstroRackWindow(QMainWindow):
         img = load_image(file_path)
         if img is None or img.size == 0:
             raise ValueError(f"Не удалось декодировать изображение из файла: {file_path}")
+
+        # 4.1. Извлечение даты съёмки из метаданных (EXIF / FITS) для лунной линейки
+        capture_dt = extract_capture_date(file_path)
+        if capture_dt is not None:
+            self._lunar_capture_date = capture_dt
+            self._lunar_date_auto_detected = True
+            if self._lunar_mode == "date":
+                dist_km = calculate_lunar_distance(capture_dt)
+                self._lunar_distance_km = dist_km
+                self.canvas.set_lunar_distance(dist_km)
+                self.toolbox.set_lunar_distance(dist_km)
+        else:
+            self._lunar_date_auto_detected = False
+            if self._lunar_capture_date is None:
+                self._lunar_capture_date = datetime.datetime.now(datetime.timezone.utc)
+            if self._lunar_mode == "date":
+                dist_km = calculate_lunar_distance(self._lunar_capture_date)
+                self._lunar_distance_km = dist_km
+                self.canvas.set_lunar_distance(dist_km)
+                self.toolbox.set_lunar_distance(dist_km)
 
         # 5. Блокировка сигналов от слайдеров и инсертов (QSignalBlocker)
         blockers = [
