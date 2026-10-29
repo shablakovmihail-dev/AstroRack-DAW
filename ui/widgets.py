@@ -3,7 +3,7 @@ import datetime
 from typing import Optional, Union, Callable
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRectF, QTimer, QObject, QEvent, QDate
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRectF, QTimer, QObject, QEvent, QDate, QSize
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QLabel, QSlider, QCheckBox, QPushButton, QDialog,
     QToolButton, QDoubleSpinBox, QDateEdit, QRadioButton, QVBoxLayout, QHBoxLayout, QMessageBox, QComboBox,
@@ -294,7 +294,7 @@ class PlanetarySlider(QSlider):
         super().__init__(orientation, parent)
         self.setRange(0, 10000)
         self.setMouseTracking(True)
-        self.setFixedHeight(24)
+        self.setFixedHeight(22)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._theme = THEMES['A']
 
@@ -446,6 +446,7 @@ class AstroParamRow(QWidget):
         self.decimals = decimals
         self.neutral_val = neutral_val
         self.has_sub_bypass = has_sub_bypass
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         main_vbox = QVBoxLayout(self)
         main_vbox.setContentsMargins(0, 0, 0, 0)
@@ -498,7 +499,7 @@ class AstroParamRow(QWidget):
         else:
             self.chk_sub_bypass = None
 
-        self.lbl_title = QLabel(title)
+        self.lbl_title = ElidedLabel(title, self)
         self.lbl_title.setStyleSheet("color: #777788; font-size: 10px; font-weight: bold;" if self.has_sub_bypass else "color: #b0b0be; font-size: 10px; font-weight: bold;")
 
         self.btn_help = HelpIcon(self.param_title)
@@ -540,7 +541,7 @@ class AstroParamRow(QWidget):
 
         self.slider = PlanetarySlider(Qt.Orientation.Horizontal)
         self.slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.slider.setMinimumWidth(80)
+        self.slider.setMinimumWidth(50)
         self.slider.setValue(self._val_to_slider(default_val))
         self.slider.doubleClicked.connect(self.reset_to_default)
         self.slider.setEnabled(not self.has_sub_bypass)
@@ -575,8 +576,8 @@ class AstroParamRow(QWidget):
         self.slider.valueChanged.connect(self._on_slider_changed)
         self.spinbox.valueChanged.connect(self._on_spinbox_changed)
 
-        ctrl_hbox.addWidget(self.slider)
-        ctrl_hbox.addWidget(self.spinbox)
+        ctrl_hbox.addWidget(self.slider, 1)
+        ctrl_hbox.addWidget(self.spinbox, 0)
         main_vbox.addLayout(ctrl_hbox)
 
     def apply_theme(self, theme: dict):
@@ -1038,6 +1039,24 @@ class _DryWetRowAdapter(QObject):
             self._ctrl.setEnabled(enabled)
 
 
+class ElidedLabel(QLabel):
+    """QLabel с эластичной минимальной шириной, не распирающий горизонтальный layout."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._full_text = text
+
+    def setText(self, text):
+        self._full_text = str(text)
+        super().setText(text)
+
+    def text(self) -> str:
+        return getattr(self, '_full_text', super().text())
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(20, self.fontMetrics().height())
+
+
 class CollapsibleHeader(QFrame):
     toggle_requested = pyqtSignal()
 
@@ -1128,8 +1147,9 @@ class CollapsibleHeader(QFrame):
             }}
         """)
 
-        self.lbl_title = QLabel(title)
-        self.lbl_title.setStyleSheet("background: transparent; color: #666675; font-size: 10.5px; font-weight: bold;")
+        self.lbl_title = ElidedLabel(title, self)
+        self.lbl_title.setStyleSheet("background: transparent; color: #b0b0c0; font-size: 12px; font-weight: bold;")
+        self.lbl_title.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         layout.addWidget(self.chk_bypass)
         layout.addWidget(self.arrow_btn)
@@ -1314,6 +1334,7 @@ class CollapsibleInsertBox(QWidget):
 
     def __init__(self, title: str, has_dry_wet: bool = False, parent=None):
         super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -1328,6 +1349,7 @@ class CollapsibleInsertBox(QWidget):
 
         self.content_widget = QFrame()
         self.content_widget.setObjectName("InsertContent")
+        self.content_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self.content_widget.setStyleSheet("""
             QFrame#InsertContent {
                 background-color: #141419;
@@ -3591,10 +3613,11 @@ class AstroHistogramHeader(QFrame):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(5)
+        layout.setSpacing(3)
 
-        self.lbl_title = QLabel("LUMINANCE HISTOGRAM")
-        self.lbl_title.setStyleSheet("color: #555562; font-weight: bold; font-size: 10px; letter-spacing: 1px;")
+        self.lbl_title = ElidedLabel("LUMINANCE HISTOGRAM", self)
+        self.lbl_title.setStyleSheet("color: #888899; font-weight: bold; font-size: 11px; letter-spacing: 0.5px;")
+        self.lbl_title.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         layout.addWidget(self.lbl_title)
         layout.addStretch()
 
@@ -3611,8 +3634,8 @@ class AstroHistogramHeader(QFrame):
         self.btn_full.setCheckable(True)
         self.btn_auto.setCheckable(True)
         self.btn_full.setChecked(True)
-        self.btn_full.setFixedSize(30, 18)
-        self.btn_auto.setFixedSize(30, 18)
+        self.btn_full.setFixedSize(26, 18)
+        self.btn_auto.setFixedSize(26, 18)
         self.btn_full.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_auto.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_full.setToolTip("Полный кадр: гистограмма строится по всему снимку целиком")
@@ -3640,8 +3663,8 @@ class AstroHistogramHeader(QFrame):
         self.btn_log.setCheckable(True)
         self.btn_lin.setCheckable(True)
         self.btn_log.setChecked(True)
-        self.btn_log.setFixedSize(26, 18)
-        self.btn_lin.setFixedSize(26, 18)
+        self.btn_log.setFixedSize(24, 18)
+        self.btn_lin.setFixedSize(24, 18)
         self.btn_log.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_lin.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_log.setToolTip("Логарифмическая шкала по Y (раскрывает полутона космоса)")
@@ -3669,8 +3692,8 @@ class AstroHistogramHeader(QFrame):
         self.btn_lum.setCheckable(True)
         self.btn_rgb.setCheckable(True)
         self.btn_lum.setChecked(True)
-        self.btn_lum.setFixedSize(26, 18)
-        self.btn_rgb.setFixedSize(26, 18)
+        self.btn_lum.setFixedSize(24, 18)
+        self.btn_rgb.setFixedSize(24, 18)
         self.btn_lum.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_rgb.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_lum.setToolTip("Режим Luminance: интегральная яркость Rec.709")
@@ -3687,7 +3710,7 @@ class AstroHistogramHeader(QFrame):
 
         # Кнопка контекстной справки: [ ? ]
         self.btn_help = QPushButton("?")
-        self.btn_help.setFixedSize(18, 18)
+        self.btn_help.setFixedSize(16, 18)
         self.btn_help.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_help.setToolTip("Справка по профессиональному чтению гистограммы")
         self.btn_help.clicked.connect(self._open_help_dialog)
@@ -3842,7 +3865,8 @@ class AstroHistogramWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(84)
-        self.setMinimumWidth(200)
+        self.setMinimumWidth(220)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMouseTracking(True)
 
         self.header = None
@@ -4279,4 +4303,147 @@ class AstroHistogramWidget(QWidget):
                 return True
 
         return super().event(event)
+
+
+# =============================================================================
+# РУЧКА-ПЛАНКА СВОРАЧИВАНИЯ И РЕСАЙЗА ПРАВОГО РЭКА (RACK TAB HANDLE)
+# =============================================================================
+
+class RackTabHandle(QFrame):
+    """
+    Левая вертикальная планка-язычок правого рэка инсертов (ширина 14–16 px).
+    Служит ручкой интерактивного изменения ширины (Splitter Handle) и
+    содержит кнопку-шеврон для сворачивания/разворачивания рэка инсертов.
+    """
+    toggle_requested = pyqtSignal()
+    width_dragged = pyqtSignal(int)  # delta в пикселях
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("rackTabHandle")
+        self.setFixedWidth(16)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self._collapsed = False
+        self._dragging = False
+        self._drag_start_x = 0.0
+        self._initial_panel_width = 350
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addStretch(1)
+
+        self.collapse_btn = QPushButton("⯈", self)
+        self.collapse_btn.setObjectName("rackCollapseBtn")
+        self.collapse_btn.setFlat(True)
+        self.collapse_btn.setFixedSize(16, 36)
+        self.collapse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.collapse_btn.setToolTip("Свернуть панель инсертов")
+        self.collapse_btn.clicked.connect(self._on_btn_clicked)
+        self.btn_toggle = self.collapse_btn  # Обратная совместимость
+        layout.addWidget(self.collapse_btn)
+        layout.addStretch(1)
+
+        self.update_collapse_visual_state(is_collapsed=False)
+
+    def set_collapsed(self, collapsed: bool):
+        self._collapsed = bool(collapsed)
+        self.update_collapse_visual_state(is_collapsed=self._collapsed)
+
+    def is_collapsed(self) -> bool:
+        return self._collapsed
+
+    def update_collapse_visual_state(self, is_collapsed: bool = False):
+        self._collapsed = bool(is_collapsed)
+        if self._collapsed:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setStyleSheet("""
+                QFrame#rackTabHandle {
+                    background-color: #101218;
+                    border-left: 2px solid #00e5ff;
+                    border-right: none;
+                    border-top: none;
+                    border-bottom: none;
+                }
+            """)
+            self.collapse_btn.setText("⯇")
+            self.collapse_btn.setToolTip("Развернуть панель инсертов")
+            self.collapse_btn.setStyleSheet("""
+                QPushButton#rackCollapseBtn {
+                    background: transparent;
+                    color: #64748b;
+                    border: none;
+                    font-size: 10px;
+                    padding: 0;
+                    margin: 0;
+                }
+                QPushButton#rackCollapseBtn:hover {
+                    color: #00e5ff;
+                }
+            """)
+        else:
+            self.setCursor(Qt.CursorShape.SplitHCursor)
+            self.setStyleSheet("""
+                QFrame#rackTabHandle {
+                    background-color: #101218;
+                    border-left: 1px solid #1a202c;
+                    border-right: none;
+                    border-top: none;
+                    border-bottom: none;
+                }
+            """)
+            self.collapse_btn.setText("⯈")
+            self.collapse_btn.setToolTip("Свернуть панель инсертов")
+            self.collapse_btn.setStyleSheet("""
+                QPushButton#rackCollapseBtn {
+                    background: transparent;
+                    color: #64748b;
+                    border: none;
+                    font-size: 10px;
+                    padding: 0;
+                    margin: 0;
+                }
+                QPushButton#rackCollapseBtn:hover {
+                    color: #00e5ff;
+                }
+            """)
+
+    def _update_appearance(self):
+        self.update_collapse_visual_state(is_collapsed=self._collapsed)
+
+    def _on_btn_clicked(self):
+        self.toggle_requested.emit()
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        if not self._collapsed:
+            self.setCursor(Qt.CursorShape.SplitHCursor)
+        else:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._collapsed:
+                self.toggle_requested.emit()
+            else:
+                self._dragging = True
+                self._drag_start_x = event.globalPosition().x()
+                panel = self.parentWidget()
+                self._initial_panel_width = panel.width() if panel else 340
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self._collapsed:
+            if not self._dragging:
+                self.setCursor(Qt.CursorShape.SplitHCursor)
+            else:
+                delta = int(round(event.globalPosition().x() - self._drag_start_x))
+                self.width_dragged.emit(delta)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+        super().mouseReleaseEvent(event)
+
 

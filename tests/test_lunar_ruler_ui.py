@@ -537,9 +537,9 @@ class TestLunarRulerUI(unittest.TestCase):
     def test_layout_grid_isolation_and_shelf_compaction(self):
         from ui.main_window import AstroRackWindow
         win = AstroRackWindow()
-        # Verify right panel fixed width
-        self.assertEqual(win.right_panel.width(), 340)
-        self.assertEqual(win.rack_container.width(), 340)
+        # Verify right panel width
+        self.assertEqual(win.right_panel.width(), 350)
+        self.assertEqual(win.rack_container.width(), 350)
 
         # Verify measurement shelf belongs to canvas_container
         self.assertIsNotNone(win.canvas_container)

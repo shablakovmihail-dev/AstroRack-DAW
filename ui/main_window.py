@@ -34,7 +34,7 @@ from .widgets import (
     WaveletInsert, RichardsonLucyInsert, ToneContrastInsert, ColorMonoInsert,
     LocalContrastInsert, ColorEngineInsert,
     ToolboxPanel, PresetComboDelegate, PsfInspectorDialog, TelescopeOpticsDialog,
-    THEMES, StateCopyButton, AstroHistogramHeader
+    THEMES, StateCopyButton, AstroHistogramHeader, RackTabHandle
 )
 from .dialogs import AboutDialog, ResetConfirmDialog
 
@@ -178,7 +178,8 @@ class AstroRackWindow(QMainWindow):
         self.thread.start()
 
         self._panel_collapsed = False
-        self._last_panel_width = 380
+        self.last_expanded_width = 350
+        self._last_panel_width = 350
 
         self._setup_ui()
         self._apply_dark_theme()
@@ -463,57 +464,43 @@ class AstroRackWindow(QMainWindow):
         work_hbox.addWidget(self.toolbox)
 
         # 4. РАБОЧАЯ ОБЛАСТЬ: SPLITTER И ПАНЕЛЬ ИНСЕРТОВ
-        # Правая панель (Insert Rack): тянущаяся через QSplitter со складной кнопкой слева
+        # Правая панель (Insert Rack): тянущаяся через QSplitter со складной кнопкой-планкой слева
         self.rack_container = CollapsibleRackContainer()
-        self.rack_container.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self.rack_container.setFixedWidth(340)
+        self.rack_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.rack_container.setMinimumWidth(300)
+        self.rack_container.setMaximumWidth(550)
         self.right_panel = self.rack_container
         rack_outer_hbox = QHBoxLayout(self.rack_container)
         rack_outer_hbox.setContentsMargins(0, 0, 0, 0)
         rack_outer_hbox.setSpacing(0)
+        rack_outer_hbox.setAlignment(Qt.AlignmentFlag.AlignRight)
 
-        # Контейнер для кнопки сворачивания: центрирует кнопку по вертикали, предотвращая растягивание в полосу
-        toggle_bar = QWidget()
-        toggle_bar.setFixedWidth(16)
-        toggle_bar.setStyleSheet("background-color: transparent;")
-        toggle_vbox = QVBoxLayout(toggle_bar)
-        toggle_vbox.setContentsMargins(0, 0, 0, 0)
-        toggle_vbox.setSpacing(0)
-        toggle_vbox.addStretch()
+        # Левая планка-язычок (16px) с кнопкой-шевроном и поддержкой интерактивного ресайза
+        self.tab_handle = RackTabHandle(self.rack_container)
+        self.collapse_btn = self.tab_handle.collapse_btn
+        self.btn_panel_toggle = self.collapse_btn
+        self.update_collapse_visual_state = self.tab_handle.update_collapse_visual_state
+        self.tab_handle.toggle_requested.connect(self._toggle_right_panel)
+        self.tab_handle.width_dragged.connect(self._on_rack_handle_dragged)
+        rack_outer_hbox.addWidget(self.tab_handle)
 
-        self.btn_panel_toggle = QPushButton("►")
-        self.btn_panel_toggle.setFixedSize(16, 52)
-        self.btn_panel_toggle.setToolTip("Свернуть панель настроек")
-        self.btn_panel_toggle.setStyleSheet("""
-            QPushButton {
-                background-color: #1e1e28;
-                border: 1px solid #363648;
-                border-radius: 5px;
-                color: #00adb5;
-                font-size: 10px;
-                font-weight: bold;
-                padding: 0;
-            }
-            QPushButton:hover {
-                background-color: #00adb5;
-                border-color: #00fff2;
-                color: #111114;
-            }
-        """)
-        self.btn_panel_toggle.clicked.connect(self._toggle_right_panel)
-        toggle_vbox.addWidget(self.btn_panel_toggle)
-        toggle_vbox.addStretch()
-
-        rack_outer_hbox.addWidget(toggle_bar)
+        # Начальное применение стилей и шеврона ⯈ со старта приложения
+        self.collapse_btn.setText("⯈")
+        self.collapse_btn.setToolTip("Свернуть панель инсертов")
+        self.update_collapse_visual_state(is_collapsed=False)
 
         # Внутреннее содержимое панели инсертов
         self.rack_inner_widget = RackInnerWidget()
+        self.rack_inner_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         rack_vbox = QVBoxLayout(self.rack_inner_widget)
         rack_vbox.setContentsMargins(8, 0, 8, 0)
         rack_vbox.setSpacing(8)
 
         self.hist_header = AstroHistogramHeader()
         self.histogram = MiniHistogramWidget()
+        self.histogram_widget = self.histogram
+        self.histogram_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.histogram_widget.setMinimumWidth(220)
         self.hist_header.attach_histogram(self.histogram)
         rack_vbox.addWidget(self.hist_header)
         rack_vbox.addWidget(self.histogram)
@@ -556,6 +543,8 @@ class AstroRackWindow(QMainWindow):
         self.btn_global_bypass = QPushButton("MASTER BYPASS: INACTIVE (EFFECTS ON)")
         self.btn_global_bypass.setCheckable(True)
         self.btn_global_bypass.setFixedHeight(28)
+        self.btn_global_bypass.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.btn_global_bypass.setMinimumWidth(100)
         self.btn_global_bypass.setStyleSheet("""
             QPushButton {
                 background-color: #1e1e26;
@@ -578,18 +567,23 @@ class AstroRackWindow(QMainWindow):
         self.btn_global_bypass.toggled.connect(self._on_global_bypass_toggled)
         rack_vbox.addWidget(self.btn_global_bypass)
 
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.inserts_scroll_area = QScrollArea()
+        self.inserts_scroll_area.setWidgetResizable(True)
+        self.inserts_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.inserts_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.inserts_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll_area = self.inserts_scroll_area
 
         scroll_widget = QWidget()
+        scroll_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         scroll_layout = QVBoxLayout(scroll_widget)
         scroll_layout.setContentsMargins(0, 4, 0, 0)
         scroll_layout.setSpacing(8)
+        scroll_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         rack_header = QLabel("EFFECT INSERTS RACK")
-        rack_header.setStyleSheet("color: #555562; font-weight: bold; font-size: 10px; letter-spacing: 1px;")
+        rack_header.setStyleSheet("color: #888899; font-weight: bold; font-size: 11px; letter-spacing: 1px;")
+        rack_header.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         scroll_layout.addWidget(rack_header)
 
         self.insert1_wavelet = WaveletInsert()
@@ -603,6 +597,7 @@ class AstroRackWindow(QMainWindow):
             self.insert1_wavelet, self.insert2_rl, self.insert3_tone,
             self.insert4_mono, self.insert5_lc, self.insert6_color
         ]:
+            insert.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
             insert.slider_changed.connect(self.schedule_render)
             insert.bypass_toggled.connect(self.trigger_render_immediate)
             insert.state_committed.connect(self._on_parameter_committed)
@@ -634,12 +629,12 @@ class AstroRackWindow(QMainWindow):
         scroll_layout.addWidget(self.insert4_mono)
         scroll_layout.addWidget(self.insert5_lc)
         scroll_layout.addWidget(self.insert6_color)
-        scroll_layout.addStretch()
+        scroll_layout.addStretch(1)
 
-        scroll_area.setWidget(scroll_widget)
-        rack_vbox.addWidget(scroll_area)
+        self.scroll_area.setWidget(scroll_widget)
+        rack_vbox.addWidget(self.scroll_area)
 
-        rack_outer_hbox.addWidget(self.rack_inner_widget)
+        rack_outer_hbox.addWidget(self.rack_inner_widget, 1)
 
         # Контейнер холста и фиксированной нижней панели измерений
         self.canvas_container = QWidget()
@@ -659,7 +654,7 @@ class AstroRackWindow(QMainWindow):
         self.splitter.setCollapsible(1, False)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 0)
-        self.splitter.setSizes([1160, 340])
+        self.splitter.setSizes([1150, 350])
         self.splitter.splitterMoved.connect(self._on_splitter_moved)
 
         work_hbox.addWidget(self.splitter)
@@ -1104,74 +1099,79 @@ class AstroRackWindow(QMainWindow):
         """)
         msg.exec()
 
+    def _on_rack_handle_dragged(self, delta: int):
+        if getattr(self, '_panel_collapsed', False):
+            return
+        initial_w = getattr(self.tab_handle, '_initial_panel_width', self.rack_container.width())
+        new_width = max(300, min(550, int(round(initial_w - delta))))
+        self._set_panel_width(new_width)
+        self.last_expanded_width = new_width
+        self._last_panel_width = new_width
+
     def _get_panel_width(self) -> int:
         sizes = self.splitter.sizes()
-        return sizes[1] if len(sizes) > 1 else 380
+        return sizes[1] if len(sizes) > 1 else 350
 
     def _set_panel_width(self, w: int):
         sizes = self.splitter.sizes()
         total_w = sum(sizes)
         if total_w <= 0:
             total_w = max(500, self.width() - 50)
-        w = max(16, min(total_w - 100, w))
-        self.splitter.setSizes([total_w - w, w])
+        if getattr(self, '_panel_collapsed', False):
+            target_w = 16
+        else:
+            target_w = max(300, min(550, w))
+        self.splitter.setSizes([total_w - target_w, target_w])
 
     panelWidth = pyqtProperty(int, _get_panel_width, _set_panel_width)
 
     def _on_splitter_moved(self, pos: int, index: int):
-        if not self._panel_collapsed:
+        if not getattr(self, '_panel_collapsed', False):
             sizes = self.splitter.sizes()
             if len(sizes) > 1 and sizes[1] >= 200:
+                self.last_expanded_width = sizes[1]
                 self._last_panel_width = sizes[1]
 
     def _toggle_right_panel(self):
-        if self._panel_anim.state() == QPropertyAnimation.State.Running:
-            return
-
-        current_w = self._get_panel_width()
-        if not self._panel_collapsed:
-            self._target_collapsed = True
-            self._last_panel_width = max(340, current_w)
-            self.rack_container.setMinimumWidth(0)
-            self.rack_container.setMaximumWidth(10000)
-            self._panel_anim.stop()
-            self._panel_anim.setStartValue(current_w)
-            self._panel_anim.setEndValue(16)
-            self._panel_anim.start()
-        else:
-            self._target_collapsed = False
-            self.rack_inner_widget.setVisible(True)
-            self.rack_container.setMinimumWidth(0)
-            self.rack_container.setMaximumWidth(10000)
-            self._panel_anim.stop()
-            self._panel_anim.setStartValue(current_w)
-            self._panel_anim.setEndValue(self._last_panel_width)
-            self._panel_anim.start()
-
-    def _on_panel_anim_finished(self):
-        if getattr(self, '_target_collapsed', False):
-            self._panel_collapsed = True
-            self.rack_inner_widget.setVisible(False)
-            self.rack_container.setFixedWidth(16)
-            self._set_panel_width(16)
-            self.btn_panel_toggle.setText("◄")
-            self.btn_panel_toggle.setToolTip("Развернуть панель настроек")
-            if self.splitter.handle(1):
-                self.splitter.handle(1).setEnabled(False)
-        else:
+        if getattr(self, '_panel_collapsed', False):
+            # Развернуть панель настроек
             self._panel_collapsed = False
-            self.rack_container.setFixedWidth(340)
             self.rack_inner_widget.setVisible(True)
-            self._set_panel_width(340)
-            self.btn_panel_toggle.setText("►")
-            self.btn_panel_toggle.setToolTip("Свернуть панель настроек")
+            self.rack_container.setMinimumWidth(300)
+            self.rack_container.setMaximumWidth(550)
+            self.rack_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+            target_w = getattr(self, 'last_expanded_width', getattr(self, '_last_panel_width', 350))
+            target_w = max(300, min(550, target_w))
+            self._set_panel_width(target_w)
+            self.tab_handle.set_collapsed(False)
             if self.splitter.handle(1):
                 self.splitter.handle(1).setEnabled(True)
+        else:
+            # Свернуть панель настроек
+            current_w = self._get_panel_width()
+            if current_w >= 200:
+                self.last_expanded_width = current_w
+                self._last_panel_width = current_w
+            self._panel_collapsed = True
+            self.rack_inner_widget.setVisible(False)
+            self.rack_container.setMinimumWidth(16)
+            self.rack_container.setMaximumWidth(16)
+            self._set_panel_width(16)
+            self.tab_handle.set_collapsed(True)
+            if self.splitter.handle(1):
+                self.splitter.handle(1).setEnabled(False)
+
+    def _on_panel_anim_finished(self):
+        pass
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if getattr(self, '_panel_collapsed', False):
             self._set_panel_width(16)
+        else:
+            w = getattr(self, 'last_expanded_width', getattr(self, '_last_panel_width', 350))
+            w = max(300, min(550, w))
+            self._set_panel_width(w)
 
     def _toggle_ab_state(self):
         target = 'B' if self._active_ab == 'A' else 'A'
@@ -1399,23 +1399,8 @@ class AstroRackWindow(QMainWindow):
                 }}
             """)
 
-        if hasattr(self, 'btn_panel_toggle') and self.btn_panel_toggle is not None:
-            self.btn_panel_toggle.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: #1e1e28;
-                    border: 1px solid #363648;
-                    border-radius: 5px;
-                    color: {primary};
-                    font-size: 10px;
-                    font-weight: bold;
-                    padding: 0;
-                }}
-                QPushButton:hover {{
-                    background-color: {primary};
-                    border-color: {bright};
-                    color: #111114;
-                }}
-            """)
+        if hasattr(self, 'tab_handle') and self.tab_handle is not None:
+            self.tab_handle.update_collapse_visual_state(getattr(self, '_panel_collapsed', False))
 
         if hasattr(self, 'btn_reset_image') and self.btn_reset_image is not None:
             self.btn_reset_image.setStyleSheet("""
