@@ -375,3 +375,36 @@ class AstroEngine:
         from .pipeline import blend_dry_wet as _blend
         return _blend(dry_img, wet_img, wet_ratio)
 
+    @staticmethod
+    def soft_clip_limiter(img: np.ndarray, threshold: float = 0.88) -> np.ndarray:
+        """Мастер-лимитер светов (Master Soft-Clip Limiter) с гладким тангенциальным коленом."""
+        return soft_clip_limiter(img, threshold)
+
+
+def soft_clip_limiter(img: np.ndarray, threshold: float = 0.88) -> np.ndarray:
+    """Мастер-лимитер светов (Master Soft-Clip Limiter).
+
+    Мягкое сжатие пересветов гладким тангенциальным коленом (Soft-Knee Knee Roll-off):
+      y = x,                                           при x <= T
+      y = T + (1.0 - T) * np.tanh((x - T) / (1.0 - T)), при x > T
+
+    Работает в нормализованном диапазоне [0.0, 1.0] с монохромными (2D)
+    и цветными (3D) изображениями float32. Предотвращает жесткую отсечку (clipping),
+    сохраняя микротекстуру деталей в ярких зонах планет и лунных кратеров.
+    """
+    if img is None or img.size == 0:
+        return img
+
+    out = np.array(img, dtype=np.float32, copy=True)
+    t = float(threshold)
+    scale = 1.0 - t
+    if scale <= 1e-6:
+        return np.clip(out, 0.0, 1.0)
+
+    over = out > t
+    if np.any(over):
+        diff = (out[over] - t) / scale
+        out[over] = t + scale * np.tanh(diff)
+
+    return np.clip(out, 0.0, 1.0)
+

@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 from scipy.ndimage import convolve1d, gaussian_filter
 from PyQt6.QtCore import Qt, QObject, pyqtSignal
-from .processing import AstroEngine
+from .processing import AstroEngine, soft_clip_limiter
 from .enhance import apply_local_contrast, apply_color_engine
 
 
@@ -433,28 +433,49 @@ class PipelineWorker(QObject):
             or (abs(cs_sat - 1.0) <= 1e-3 and cs_mineral <= 1e-3 and not cs_bg)
         )
         if ins6_neutral or cs_wet_ratio <= 0.001:
-            return stage5_img
+            stage6_img = stage5_img
+            key6 = key5
+        else:
+            if self._is_cancelled(task_id):
+                return None
+
+            core_key6 = (key5, 'cs', cs_sat, cs_mineral, cs_bg, cs_coords)
+            key6 = (core_key6, round(cs_wet_ratio, 4))
+
+            cached6 = self._stage_cache.get('stage6')
+            if cached6 is not None and cached6[0] == key6:
+                stage6_img = cached6[1]
+            else:
+                stage6_wet = self._run_cached_stage(
+                    'stage6_wet', core_key6,
+                    lambda: apply_color_engine(stage5_img, cs_sat, cs_mineral, cs_bg, cs_coords),
+                    task_id
+                )
+                if stage6_wet is None:
+                    return None
+                stage6_img = blend_dry_wet(stage5_img, stage6_wet, cs_wet_ratio)
+                self._stage_cache['stage6'] = (key6, stage6_img)
+
+        # =====================================================================
+        # MASTER BUS OUTPUT: Master Soft-Clip Limiter
+        # =====================================================================
+        limiter_on = bool(params.get('master_limiter_enabled', False) or params.get('limiter_enabled', False))
+        if not limiter_on:
+            return stage6_img
+
+        limiter_thresh = float(params.get('limiter_threshold', 0.88))
+        key_limiter = (key6, 'master_limiter', round(limiter_thresh, 4))
+
+        cached_limiter = self._stage_cache.get('master_limiter')
+        if cached_limiter is not None and cached_limiter[0] == key_limiter:
+            return cached_limiter[1]
 
         if self._is_cancelled(task_id):
             return None
 
-        core_key6 = (key5, 'cs', cs_sat, cs_mineral, cs_bg, cs_coords)
-        key6 = (core_key6, round(cs_wet_ratio, 4))
-
-        cached6 = self._stage_cache.get('stage6')
-        if cached6 is not None and cached6[0] == key6:
-            return cached6[1]
-
-        stage6_wet = self._run_cached_stage(
-            'stage6_wet', core_key6,
-            lambda: apply_color_engine(stage5_img, cs_sat, cs_mineral, cs_bg, cs_coords),
-            task_id
-        )
-        if stage6_wet is None:
-            return None
-        stage6_img = blend_dry_wet(stage5_img, stage6_wet, cs_wet_ratio)
-        self._stage_cache['stage6'] = (key6, stage6_img)
-        return stage6_img
+        limiter_img = soft_clip_limiter(stage6_img, threshold=limiter_thresh)
+        self._stage_cache['master_limiter'] = (key_limiter, limiter_img)
+        return limiter_img
 
     def _run_cached_stage(self, slot: str, key, compute_fn, task_id: int):
         """Одноэлементный кэш стадии: пересчёт только при смене ключа (вход + параметры).

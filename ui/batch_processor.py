@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QIcon, QDesktopServices
 
-from core.processing import AstroEngine
+from core.processing import AstroEngine, soft_clip_limiter
 from core.enhance import apply_local_contrast, apply_color_engine
 from core.pipeline import blend_dry_wet, _extract_wet_ratio
 from core.sound import sound_engine
@@ -361,6 +361,11 @@ def process_frame_pipeline(
             return None
         stage6_wet = apply_color_engine(img, cs_sat, cs_mineral, cs_bg, cs_coords)
         img = blend_dry_wet(img, stage6_wet, cs_wet_ratio)
+
+    limiter_on = bool(rack_state.get('master_limiter_enabled', False) or rack_state.get('limiter_enabled', False))
+    if limiter_on:
+        limiter_thresh = float(rack_state.get('limiter_threshold', 0.88))
+        img = soft_clip_limiter(img, threshold=limiter_thresh)
 
     return np.ascontiguousarray(np.clip(img, 0.0, 1.0), dtype=np.float32)
 

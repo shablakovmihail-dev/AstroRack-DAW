@@ -517,7 +517,6 @@ class AstroRackWindow(QMainWindow):
         self.btn_state_toggle.setFixedHeight(24)
         self.btn_state_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_state_toggle.clicked.connect(self._toggle_ab_state)
-        self._update_state_toggle_ui()
 
         # Совместимость с внутренними ссылками
         self.btn_state_a = self.btn_state_toggle
@@ -547,27 +546,20 @@ class AstroRackWindow(QMainWindow):
         self.btn_global_bypass.setFixedHeight(28)
         self.btn_global_bypass.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.btn_global_bypass.setMinimumWidth(100)
-        self.btn_global_bypass.setStyleSheet("""
-            QPushButton {
-                background-color: #1e1e26;
-                border: 1px solid #363646;
-                border-radius: 5px;
-                color: #00adb5;
-                font-weight: bold;
-                font-size: 11px;
-                letter-spacing: 0.5px;
-            }
-            QPushButton:hover {
-                border-color: #00fff2;
-            }
-            QPushButton:checked {
-                background-color: #ff3344;
-                border-color: #ff6677;
-                color: #ffffff;
-            }
-        """)
         self.btn_global_bypass.toggled.connect(self._on_global_bypass_toggled)
         rack_vbox.addWidget(self.btn_global_bypass)
+
+        self.btn_master_limiter = QPushButton("LIMITER: OFF")
+        self.btn_master_limiter.setCheckable(True)
+        self.btn_master_limiter.setFixedHeight(26)
+        self.btn_master_limiter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.btn_master_limiter.setMinimumWidth(100)
+        self.btn_master_limiter.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_master_limiter.setToolTip("Master Soft-Clip Limiter: компрессия ярких светов (Threshold 0.88)")
+        self.btn_master_limiter.toggled.connect(self._on_master_limiter_toggled)
+        rack_vbox.addWidget(self.btn_master_limiter)
+
+        self.update_master_accent_theme(self._active_ab)
 
         self.inserts_scroll_area = QScrollArea()
         self.inserts_scroll_area.setWidgetResizable(True)
@@ -1002,6 +994,8 @@ class AstroRackWindow(QMainWindow):
         QShortcut(QKeySequence("H"), self, lambda: self._apply_geometry(AstroEngine.flip_horizontal, "Flip Horizontal"))
         QShortcut(QKeySequence("V"), self, lambda: self._apply_geometry(AstroEngine.flip_vertical, "Flip Vertical"))
         QShortcut(QKeySequence("Space"), self, lambda: self.btn_global_bypass.toggle())
+        QShortcut(QKeySequence("Tab"), self, self._toggle_ab_state)
+        QShortcut(QKeySequence("K"), self, lambda: self.btn_master_limiter.toggle())
         QShortcut(QKeySequence("S"), self, lambda: self.btn_split_view.toggle() if self.btn_split_view.isEnabled() else None)
         QShortcut(QKeySequence("F1"), self, self._show_hotkeys_dialog)
         QShortcut(QKeySequence("Escape"), self, self._reset_active_tools)
@@ -1055,6 +1049,8 @@ class AstroRackWindow(QMainWindow):
                 <tr><td><b>H</b></td><td>Отразить кадр по горизонтали (Flip H)</td></tr>
                 <tr><td><b>V</b></td><td>Отразить кадр по вертикали (Flip V)</td></tr>
                 <tr><td><b>Space (Пробел)</b></td><td>Master Bypass (мгновенное сравнение До/После)</td></tr>
+                <tr><td><b>Tab</b></td><td>Переключение состояний [ State A ] / [ State B ]</td></tr>
+                <tr><td><b>K</b></td><td>Master Limiter (компрессия пересветов)</td></tr>
                 <tr><td><b>Ctrl + O</b></td><td>Открыть изображение (Open Image)</td></tr>
                 <tr><td><b>Ctrl + S</b></td><td>Экспортировать результат (Export Image)</td></tr>
                 <tr><td><b>Ctrl + B</b></td><td>Пакетная обработка кадров (Batch Process)</td></tr>
@@ -1180,47 +1176,163 @@ class AstroRackWindow(QMainWindow):
         target = 'B' if self._active_ab == 'A' else 'A'
         self._switch_ab_state(target)
 
-    def _update_state_toggle_ui(self):
-        if not hasattr(self, 'btn_state_toggle'):
-            return
-        theme = THEMES.get(self._active_ab, THEMES['A'])
-        if self._active_ab == 'A':
-            self.btn_state_toggle.setText("State: [ A ]")
-            self.btn_state_toggle.setToolTip("Текущий снимок: State A (Cyan Accent). Клик — переключить на State B")
-            self.btn_state_toggle.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {theme['bg_accent']};
-                    border: 1px solid {theme['bright']};
-                    color: {theme['bright']};
-                    font-weight: bold;
-                    font-size: 11px;
-                    border-radius: 4px;
-                    padding: 2px 10px;
-                }}
-                QPushButton:hover {{
-                    background-color: {theme['bg_hover']};
-                    color: #ffffff;
-                }}
-            """)
+    def update_master_accent_theme(self, current_state: str):
+        """Централизованное обновление палитры мастер-секции под активный стейт [ A ] / [ B ].
+
+        Синхронно обновляет:
+        1. Кнопку текущего стейта:
+           - В State A: текст и обводка бирюзовые (#00e5ff).
+           - В State B: текст и обводка янтарные (#f59e0b).
+        2. Кнопку MASTER BYPASS (в активном режиме «EFFECTS ON»):
+           - В State A: текст бирюзовый (#00e5ff).
+           - В State B: текст янтарный (#f59e0b).
+           - При Master Bypass (EFFECTS OFF): нейтральный серый/красноватый приглушенный.
+        3. Кнопку MASTER LIMITER (в активном режиме):
+           - В State A: текст и неоновая рамка бирюзовые (#00e5ff).
+           - В State B: текст и неоновая рамка янтарные (#f59e0b).
+           - При выключенном лимитере: приглушенный темно-серый (#4a5568).
+        4. Плавающий бейдж активного стейта в нижнем левом углу холста («Active: State A / B»):
+           - Фон и текст соответствуют цвету активного профиля (бирюза для A, янтарь для B).
+        """
+        state = str(current_state).strip().upper()
+        if state not in ('A', 'B'):
+            state = 'A'
+        self._active_ab = state
+
+        if state == 'A':
+            accent_bright = "#00e5ff"
+            accent_bg = "#14383c"
+            accent_hover_bg = "#1c4e54"
+            overlay_bg = "rgba(14, 28, 32, 230)"
+            overlay_border = "#00e5ff"
+            limiter_active_bg = "rgba(0, 229, 255, 0.14)"
         else:
-            self.btn_state_toggle.setText("State: [ B ]")
-            self.btn_state_toggle.setToolTip("Текущий снимок: State B (Amber Accent). Клик — переключить на State A")
+            accent_bright = "#f59e0b"
+            accent_bg = "#382810"
+            accent_hover_bg = "#4e3814"
+            overlay_bg = "rgba(42, 28, 14, 230)"
+            overlay_border = "#f59e0b"
+            limiter_active_bg = "rgba(245, 158, 11, 0.14)"
+
+        # 1. Кнопка текущего стейта
+        if hasattr(self, 'btn_state_toggle') and self.btn_state_toggle is not None:
+            self.btn_state_toggle.setText(f"State: [ {state} ]")
+            self.btn_state_toggle.setToolTip(
+                f"Текущий снимок: State {state} ({'Cyan #00e5ff' if state == 'A' else 'Amber #f59e0b'}). Клик — переключить на State {'B' if state == 'A' else 'A'}"
+            )
             self.btn_state_toggle.setStyleSheet(f"""
                 QPushButton {{
-                    background-color: {theme['bg_accent']};
-                    border: 1px solid {theme['bright']};
-                    color: {theme['bright']};
+                    background-color: {accent_bg};
+                    border: 1px solid {accent_bright};
+                    color: {accent_bright};
                     font-weight: bold;
                     font-size: 11px;
                     border-radius: 4px;
                     padding: 2px 10px;
                 }}
                 QPushButton:hover {{
-                    background-color: {theme['bg_hover']};
+                    background-color: {accent_hover_bg};
                     color: #ffffff;
                 }}
             """)
 
+        # 2. Кнопка MASTER BYPASS
+        if hasattr(self, 'btn_global_bypass') and self.btn_global_bypass is not None:
+            is_bypassed = self.btn_global_bypass.isChecked()
+            if is_bypassed:
+                self.btn_global_bypass.setText("MASTER BYPASS: ACTIVE (RAW VIEW)")
+                self.btn_global_bypass.setStyleSheet("""
+                    QPushButton {
+                        background-color: #2b1f22;
+                        border: 1px solid #5a3238;
+                        border-radius: 5px;
+                        color: #c07882;
+                        font-weight: bold;
+                        font-size: 11px;
+                        letter-spacing: 0.5px;
+                    }
+                    QPushButton:hover {
+                        border-color: #88444e;
+                        color: #e0949e;
+                    }
+                """)
+            else:
+                self.btn_global_bypass.setText("MASTER BYPASS: INACTIVE (EFFECTS ON)")
+                self.btn_global_bypass.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: #1e1e26;
+                        border: 1px solid #363646;
+                        border-radius: 5px;
+                        color: {accent_bright};
+                        font-weight: bold;
+                        font-size: 11px;
+                        letter-spacing: 0.5px;
+                    }}
+                    QPushButton:hover {{
+                        border-color: {accent_bright};
+                        color: #ffffff;
+                    }}
+                """)
+
+        # 3. Кнопка MASTER LIMITER
+        if hasattr(self, 'btn_master_limiter') and self.btn_master_limiter is not None:
+            is_limiter_active = self.btn_master_limiter.isChecked()
+            if is_limiter_active:
+                self.btn_master_limiter.setText("LIMITER: ACTIVE")
+                self.btn_master_limiter.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {limiter_active_bg};
+                        border: 1.5px solid {accent_bright};
+                        border-radius: 5px;
+                        color: {accent_bright};
+                        font-weight: bold;
+                        font-size: 11px;
+                        letter-spacing: 0.5px;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {accent_hover_bg};
+                        border-color: {accent_bright};
+                        color: #ffffff;
+                    }}
+                """)
+            else:
+                self.btn_master_limiter.setText("LIMITER: OFF")
+                self.btn_master_limiter.setStyleSheet("""
+                    QPushButton {
+                        background-color: #1a1a22;
+                        border: 1px solid #363646;
+                        border-radius: 5px;
+                        color: #4a5568;
+                        font-weight: bold;
+                        font-size: 11px;
+                        letter-spacing: 0.5px;
+                    }
+                    QPushButton:hover {
+                        border-color: #555566;
+                        color: #718096;
+                    }
+                """)
+
+        # 4. Плавающий бейдж активного стейта на холсте
+        if hasattr(self, 'canvas') and hasattr(self.canvas, 'status_overlay') and self.canvas.status_overlay is not None:
+            self.canvas.status_overlay.setStyleSheet(f"""
+                QLabel {{
+                    background-color: {overlay_bg};
+                    border: 1px solid {overlay_border};
+                    border-radius: 6px;
+                    color: {accent_bright};
+                    font-size: 11px;
+                    font-weight: bold;
+                    padding: 4px 10px;
+                }}
+            """)
+            if hasattr(self.canvas, '_update_overlay_pos'):
+                self.canvas._update_overlay_pos()
+
+    def _update_state_toggle_ui(self):
+        if not hasattr(self, 'btn_state_toggle'):
+            return
+        self.update_master_accent_theme(self._active_ab)
         self._apply_state_theme(self._active_ab)
 
     def _apply_state_theme(self, state_name: str):
@@ -1751,6 +1863,9 @@ class AstroRackWindow(QMainWindow):
     def _get_current_state_dict(self) -> dict:
         state = {
             'global_bypass': self.btn_global_bypass.isChecked(),
+            'master_limiter_enabled': getattr(self, 'btn_master_limiter', None) is not None and self.btn_master_limiter.isChecked(),
+            'limiter_enabled': getattr(self, 'btn_master_limiter', None) is not None and self.btn_master_limiter.isChecked(),
+            'limiter_threshold': 0.88,
             'insert1_enabled': self.insert1_wavelet.is_enabled(),
             'insert2_enabled': self.insert2_rl.is_enabled(),
             'insert3_enabled': self.insert3_tone.is_enabled(),
@@ -2152,6 +2267,9 @@ class AstroRackWindow(QMainWindow):
     def _execute_render(self, preview: bool = False):
         params = {
             'global_bypass': self.btn_global_bypass.isChecked(),
+            'master_limiter_enabled': getattr(self, 'btn_master_limiter', None) is not None and self.btn_master_limiter.isChecked(),
+            'limiter_enabled': getattr(self, 'btn_master_limiter', None) is not None and self.btn_master_limiter.isChecked(),
+            'limiter_threshold': 0.88,
             'insert1_enabled': self.insert1_wavelet.is_enabled(),
             'insert2_enabled': self.insert2_rl.is_enabled(),
             'insert3_enabled': self.insert3_tone.is_enabled(),
@@ -2228,6 +2346,7 @@ class AstroRackWindow(QMainWindow):
 
     def _on_global_bypass_toggled(self, checked: bool):
         sound_engine.play_relay_click()
+        self.update_master_accent_theme(self._active_ab)
         if checked:
             self.btn_global_bypass.setText("MASTER BYPASS: ACTIVE (RAW VIEW)")
         else:
@@ -2250,6 +2369,12 @@ class AstroRackWindow(QMainWindow):
 
         self.trigger_render_immediate()
         self._record_current_state("Master Bypass")
+
+    def _on_master_limiter_toggled(self, checked: bool):
+        sound_engine.play_relay_click()
+        self.update_master_accent_theme(self._active_ab)
+        self.trigger_render_immediate()
+        self._record_current_state("Master Limiter")
 
     def _apply_preset_dict(self, p: dict):
         if 'raw_image' in p and p['raw_image'] is not None:
@@ -2295,11 +2420,19 @@ class AstroRackWindow(QMainWindow):
 
         self._sync_histogram_visors()
 
+        is_limiter = bool(p.get('master_limiter_enabled', p.get('limiter_enabled', False)))
+        if hasattr(self, 'btn_master_limiter') and self.btn_master_limiter is not None:
+            self.btn_master_limiter.blockSignals(True)
+            self.btn_master_limiter.setChecked(is_limiter)
+            self.btn_master_limiter.blockSignals(False)
+
         is_bypass = p.get('global_bypass', False)
         self.btn_global_bypass.blockSignals(True)
         self.btn_global_bypass.setChecked(is_bypass)
         self.btn_global_bypass.setText("MASTER BYPASS: ACTIVE (RAW VIEW)" if is_bypass else "MASTER BYPASS: INACTIVE (EFFECTS ON)")
         self.btn_global_bypass.blockSignals(False)
+
+        self.update_master_accent_theme(self._active_ab)
 
         for ins in inserts:
             if hasattr(ins, 'set_master_bypassed'):

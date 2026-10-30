@@ -364,16 +364,39 @@ class CanvasStatusOverlay(QLabel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("""
-            background-color: rgba(18, 18, 26, 215);
-            border: 1px solid #323244;
-            border-radius: 6px;
-            color: #00adb5;
-            font-size: 11px;
-            font-weight: bold;
-            padding: 4px 10px;
-        """)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.apply_theme('A')
+
+    def apply_theme(self, theme):
+        if isinstance(theme, dict):
+            state = theme.get('name', 'A')
+        else:
+            state = str(theme).strip().upper()
+
+        if state == 'B':
+            self.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(42, 28, 14, 230);
+                    border: 1px solid #f59e0b;
+                    border-radius: 6px;
+                    color: #f59e0b;
+                    font-size: 11px;
+                    font-weight: bold;
+                    padding: 4px 10px;
+                }
+            """)
+        else:
+            self.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(14, 28, 32, 230);
+                    border: 1px solid #00e5ff;
+                    border-radius: 6px;
+                    color: #00e5ff;
+                    font-size: 11px;
+                    font-weight: bold;
+                    padding: 4px 10px;
+                }
+            """)
 
 
 class CropOverlayItem(QGraphicsItem):
@@ -971,6 +994,9 @@ class AstroCanvas(QGraphicsView):
         self._theme = theme
         if hasattr(self, 'welcome_widget') and self.welcome_widget is not None:
             self.welcome_widget.apply_theme(theme)
+        if hasattr(self, 'status_overlay') and self.status_overlay is not None:
+            if hasattr(self.status_overlay, 'apply_theme'):
+                self.status_overlay.apply_theme(theme)
         self.viewport().update()
 
     def resizeEvent(self, event):
