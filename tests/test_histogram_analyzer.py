@@ -15,7 +15,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt, QPoint, QEvent
+from PyQt6.QtCore import Qt, QPoint, QPointF, QEvent
 from PyQt6.QtGui import QPainter, QImage
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -219,4 +219,194 @@ class TestHistogramAnalyzer(unittest.TestCase):
         center = r.center()
         self.assertAlmostEqual(center.x(), 200.0, places=1)
         self.assertAlmostEqual(center.y(), 150.0, places=1)
+
+    def test_exact_clipping_metrics_and_formatting(self):
+        from ui.widgets import format_clipping_text, compute_clipping_metrics
+
+        # 1. Форматирование текста
+        self.assertEqual(format_clipping_text(0, 0.0), "0% (0 px)")
+        self.assertEqual(format_clipping_text(5, 0.005), "< 0.01% (5 px)")
+        self.assertEqual(format_clipping_text(1234, 0.1234), "0.123% (1,234 px)")
+
+        # 2. Точный расчёт выбитых пикселей на кадрах
+        # 200x200 = 40,000 пикселей. Ровно 3 пикселя в нуле (< 0.01%) и 80 пикселей в пересвете (0.200%)
+        test_frame = np.full((200, 200), 0.5, dtype=np.float32)
+        test_frame[0, 0:3] = 0.0
+        test_frame[10, :80] = 1.0
+
+        metrics = compute_clipping_metrics(test_frame)
+        self.assertEqual(metrics['shadow_count'], 3)
+        self.assertAlmostEqual(metrics['shadow_pct'], (3 / 40000.0) * 100.0, places=4)
+        self.assertTrue(metrics['shadow_clip'])
+
+        self.assertEqual(metrics['highlight_count'], 80)
+        self.assertAlmostEqual(metrics['highlight_pct'], (80 / 40000.0) * 100.0, places=4)
+        self.assertTrue(metrics['highlight_clip'])
+
+        # Обновление в виджете
+        self.widget.update_histogram(test_frame)
+        self.assertEqual(self.widget.get_shadow_count(), 3)
+        self.assertEqual(self.widget.get_shadow_text(), "< 0.01% (3 px)")
+        self.assertEqual(self.widget.get_highlight_count(), 80)
+        self.assertEqual(self.widget.get_highlight_text(), f"{(80/40000.0)*100.0:.3f}% (80 px)")
+
+    def test_clipping_indicator_interactive_clicks_and_signals(self):
+        from PyQt6.QtGui import QMouseEvent
+        # Устанавливаем изображение
+        img = np.full((50, 50), 0.5, dtype=np.float32)
+        img[0, 0] = 0.0
+        img[0, 1] = 1.0
+        self.widget.update_histogram(img)
+
+        received_modes = []
+        self.widget.clipping_overlay_requested.connect(received_modes.append)
+
+        # Клик по левому индикатору (тени)
+        shadow_rect = self.widget.get_shadow_rect()
+        click_pos = shadow_rect.center().toPoint()
+        press_event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(click_pos),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier
+        )
+        self.widget.mousePressEvent(press_event)
+        self.assertIn("shadows", received_modes)
+
+        # Синхронизация состояния Checked
+        self.widget.set_clipping_overlay_mode("shadows")
+        self.assertEqual(self.widget.get_clipping_overlay_mode(), "shadows")
+
+        # Клик по правому индикатору (светы)
+        hl_rect = self.widget.get_highlight_rect()
+        click_pos_hl = hl_rect.center().toPoint()
+        press_event_hl = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(click_pos_hl),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier
+        )
+        self.widget.mousePressEvent(press_event_hl)
+        self.assertIn("highlights", received_modes)
+
+        # Проверка рендеринга виджета в активном состоянии (с темной полупрозрачной подложкой)
+        self.widget.set_clipping_overlay_mode("shadows")
+        qimg = QImage(240, 84, QImage.Format.Format_ARGB32_Premultiplied)
+        painter = QPainter(qimg)
+        self.widget.paintEvent(None)
+        painter.end()
+
+        # Сброс
+        self.widget.set_clipping_overlay_mode(None)
+        self.assertIsNone(self.widget.get_clipping_overlay_mode())
+
+    def test_canvas_sonar_overlay_and_radar(self):
+        from ui.canvas import AstroCanvas
+        from PyQt6.QtGui import QKeyEvent
+        canvas = AstroCanvas()
+
+        # Создаем изображение 100x100: черные пиксели (0.0) и пересвеченные (1.0)
+        img = np.full((100, 100), 0.4, dtype=np.float32)
+        img[10:15, 10:15] = 0.0  # Кластер теней 5x5
+        img[80:85, 80:85] = 1.0  # Кластер светов 5x5
+
+        canvas.set_processed_image(img)
+
+        # 1. Активация режима теней ("shadows")
+        canvas.set_clipping_overlay_mode("shadows")
+        self.assertEqual(canvas.clipping_overlay_mode, "shadows")
+        self.assertIsNotNone(canvas._clipping_mask_pixmap)
+        self.assertGreater(len(canvas._clipping_centroids), 0)
+        self.assertTrue(canvas._radar_timer.isActive())
+
+        # Проверка центроида
+        c0 = canvas._clipping_centroids[0]
+        self.assertAlmostEqual(c0.x(), 12.0, delta=2.0)
+        self.assertAlmostEqual(c0.y(), 12.0, delta=2.0)
+
+        # 2. Активация режима светов ("highlights")
+        canvas.set_clipping_overlay_mode("highlights")
+        self.assertEqual(canvas.clipping_overlay_mode, "highlights")
+        self.assertIsNotNone(canvas._clipping_mask_pixmap)
+        self.assertGreater(len(canvas._clipping_centroids), 0)
+        c_hl = canvas._clipping_centroids[0]
+        self.assertAlmostEqual(c_hl.x(), 82.0, delta=2.0)
+        self.assertAlmostEqual(c_hl.y(), 82.0, delta=2.0)
+
+        # 3. Переключение (toggle) того же режима отключает подсветку
+        canvas.toggle_clipping_overlay("highlights")
+        self.assertIsNone(canvas.clipping_overlay_mode)
+        self.assertIsNone(canvas._clipping_mask_pixmap)
+        self.assertFalse(canvas._radar_timer.isActive())
+
+        # 4. Нажатие Escape отключает подсветку
+        canvas.set_clipping_overlay_mode("shadows")
+        self.assertEqual(canvas.clipping_overlay_mode, "shadows")
+        esc_event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
+        canvas.keyPressEvent(esc_event)
+        self.assertIsNone(canvas.clipping_overlay_mode)
+        self.assertFalse(canvas._radar_timer.isActive())
+
+    def test_tooltips_and_help_text(self):
+        # 1. Тултип шапки [?]
+        help_tip = self.header.btn_help.toolTip()
+        self.assertIn("Гистограмма распределения яркости (Luminance Histogram):", help_tip)
+        self.assertIn("радарными кругами", help_tip)
+
+        # 2. Тултип теней
+        shadow_rect = self.widget.get_shadow_rect()
+        pos_s = shadow_rect.center().toPoint()
+        self.assertTrue(self.widget._is_in_shadow_zone(pos_s))
+
+        # 3. Тултип светов
+        hl_rect = self.widget.get_highlight_rect()
+        pos_h = hl_rect.center().toPoint()
+        self.assertTrue(self.widget._is_in_highlight_zone(pos_h))
+
+    def test_safe_overlay_generation_and_no_crash(self):
+        from ui.canvas import AstroCanvas
+        from PyQt6.QtGui import QPainter
+        from PyQt6.QtCore import QRectF
+
+        canvas = AstroCanvas()
+
+        # 1. Тест с различными типами данных и размерностями
+        # 8-bit RGB
+        img_u8 = np.zeros((64, 64, 3), dtype=np.uint8)
+        img_u8[10:20, 10:20] = 255
+        canvas.set_processed_image(img_u8)
+        pix_u8 = canvas.get_clipped_overlay_pixmap("highlights")
+        self.assertIsNotNone(pix_u8)
+
+        # 16-bit Mono
+        img_u16 = np.zeros((50, 50), dtype=np.uint16)
+        img_u16[5:15, 5:15] = 65535
+        canvas.set_processed_image(img_u16)
+        pix_u16 = canvas.get_clipped_overlay_pixmap("peaks")
+        self.assertIsNotNone(pix_u16)
+
+        # Float32 RGB [0.0..1.0] с пересветом
+        img_f32 = np.full((80, 80, 3), 0.5, dtype=np.float32)
+        img_f32[2:10, 2:10] = 1.0
+        canvas.set_processed_image(img_f32)
+        pix_f32 = canvas.get_clipped_overlay_pixmap("highlights")
+        self.assertIsNotNone(pix_f32)
+
+        # 2. Тест отрисовки drawForeground с активным сонаром (без падений)
+        canvas.set_clipping_overlay_mode("highlights")
+        self.assertGreater(len(canvas._clipping_centroids), 0)
+
+        # Отрисовка на временном QImage
+        qimg = QImage(200, 200, QImage.Format.Format_ARGB32_Premultiplied)
+        painter = QPainter(qimg)
+        canvas.drawForeground(painter, QRectF(0, 0, 200, 200))
+        painter.end()
+
+        # Отключение
+        canvas.set_clipping_overlay_mode(None)
+        self.assertIsNone(canvas.clipping_overlay_mode)
+
+
 

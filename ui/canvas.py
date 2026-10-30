@@ -1,6 +1,8 @@
 #"""Холст AstroCanvas: интерактивный Split View, лупа 300% (Alt), кадрирование и профилометр."""
 import os
+import time
 import math
+import logging
 import traceback
 import cv2
 import numpy as np
@@ -527,6 +529,7 @@ class AstroCanvas(QGraphicsView):
     fileDropped = pyqtSignal(str)
     openFileDialogRequested = pyqtSignal()
     pixelProbeChanged = pyqtSignal(str, str)
+    clipping_overlay_changed = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -536,6 +539,15 @@ class AstroCanvas(QGraphicsView):
         self._item = SplitImageGraphicsItem()
         self._scene.addItem(self._item)
         self._current_frame_float = None
+
+        # Интерактивная подсветка клиппинга (Sonar Ping Overlay)
+        self.clipping_overlay_mode = None  # None | "shadows" | "highlights"
+        self._clipping_mask_pixmap = None
+        self._clipping_centroids = []
+        self._radar_timer = QTimer(self)
+        self._radar_timer.setInterval(25)
+        self._radar_timer.timeout.connect(self._on_radar_timer_tick)
+        self._radar_start_time = 0.0
 
         self._crop_item = None
         self._crop_mode = False
@@ -715,8 +727,176 @@ class AstroCanvas(QGraphicsView):
             self._scene.setSceneRect(rect)
             self._sync_crop_overlay_size()
 
+    def _on_radar_timer_tick(self):
+        if self.clipping_overlay_mode is not None:
+            self.viewport().update()
+
+    def get_clipped_overlay_pixmap(self, mode="peaks") -> Optional[QPixmap]:
+        """Генерирует полупрозрачный слой маски клиппинга без вылетов при любых форматах (uint8, uint16, float, Mono, RGB)."""
+        try:
+            img = self._current_frame_float
+            if img is None or img.size == 0:
+                return None
+
+            h, w = img.shape[:2]
+
+            # 1. Приведение к единому каналу яркости (Luminance) [0.0, 1.0]:
+            if img.ndim == 3 and img.shape[2] >= 3:
+                # Веса sRGB для честной яркости Rec.709:
+                r = img[:, :, 0].astype(np.float32)
+                g = img[:, :, 1].astype(np.float32)
+                b = img[:, :, 2].astype(np.float32)
+                lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            else:
+                mono = img[:, :, 0] if (img.ndim == 3 and img.shape[2] >= 1) else img
+                lum = mono.astype(np.float32)
+
+            # Нормализация к диапазону [0.0, 1.0], если данные в [0, 255] или [0, 65535]:
+            if img.dtype == np.uint8 or lum.max() > 255.0:
+                lum = lum / 255.0
+            elif img.dtype == np.uint16 or lum.max() > 1.0:
+                lum = lum / 65535.0 if lum.max() > 255.0 else lum / 255.0
+            else:
+                lum = np.clip(lum, 0.0, 1.0)
+
+            # 2. Построение булевой маски:
+            if mode in ("peaks", "highlights"):
+                # Пережжённые пиксели (порог >= 0.999):
+                mask = lum >= 0.999
+                color_rgba = (255, 40, 40, 220)  # Ярко-красный полупрозрачный (ARGB: A=220, R=255, G=40, B=40)
+            else:
+                # Проваленные тени (порог <= 0.001):
+                mask = lum <= 0.001
+                color_rgba = (0, 200, 255, 220)  # Неоново-голубой (ARGB: A=220, R=0, G=200, B=255)
+
+            if not np.any(mask):
+                return None  # Нет выбитых пикселей — не тратим память
+
+            # 3. Формирование 4-канального RGBA изображения (uint8):
+            overlay_array = np.zeros((h, w, 4), dtype=np.uint8)
+            # В формате ARGB32_Premultiplied порядок байт на little-endian: B, G, R, A
+            # Для надежности задаем через прямое присвоение BGRA
+            r_val, g_val, b_val, a_val = color_rgba[0], color_rgba[1], color_rgba[2], color_rgba[3]
+            alpha_f = a_val / 255.0
+            premul_r = int(round(r_val * alpha_f))
+            premul_g = int(round(g_val * alpha_f))
+            premul_b = int(round(b_val * alpha_f))
+
+            overlay_array[mask] = (premul_b, premul_g, premul_r, a_val)
+            overlay_array = np.ascontiguousarray(overlay_array)
+
+            # 4. Безопасное создание QImage:
+            qimg = QImage(
+                overlay_array.data,
+                w,
+                h,
+                w * 4,
+                QImage.Format.Format_ARGB32_Premultiplied
+            )
+            return QPixmap.fromImage(qimg.copy())  # .copy() обязателен, чтобы отвязать память от NumPy
+
+        except Exception as e:
+            logging.error(f"Error generating clip overlay: {e}", exc_info=True)
+            return None
+
+    def set_clipping_overlay_mode(self, mode: Optional[str]):
+        """Устанавливает или отключает интерактивную подсветку клиппинга ('shadows', 'highlights', None)."""
+        if mode not in ("shadows", "highlights", None):
+            mode = None
+
+        self.clipping_overlay_mode = mode
+
+        if mode is None:
+            if hasattr(self, '_radar_timer') and self._radar_timer.isActive():
+                self._radar_timer.stop()
+            self._clipping_mask_pixmap = None
+            self._clipping_centroids = []
+            self.clipping_overlay_changed.emit(None)
+            self.viewport().update()
+            return
+
+        img = self._current_frame_float
+        if img is None or img.size == 0:
+            self._clipping_mask_pixmap = None
+            self._clipping_centroids = []
+            self.clipping_overlay_changed.emit(mode)
+            self.viewport().update()
+            return
+
+        try:
+            # Безопасная генерация оверлея
+            self._clipping_mask_pixmap = self.get_clipped_overlay_pixmap(mode)
+
+            # Вычисление центроидов для анимации радара
+            if self._clipping_mask_pixmap is not None:
+                # Получаем маску для расчета связных компонент
+                h, w = img.shape[:2]
+                if img.ndim == 3 and img.shape[2] >= 3:
+                    lum = 0.2126 * img[:, :, 0].astype(np.float32) + 0.7152 * img[:, :, 1].astype(np.float32) + 0.0722 * img[:, :, 2].astype(np.float32)
+                else:
+                    mono = img[:, :, 0] if (img.ndim == 3 and img.shape[2] >= 1) else img
+                    lum = mono.astype(np.float32)
+
+                if img.dtype == np.uint8 or lum.max() > 255.0:
+                    lum = lum / 255.0
+                elif img.dtype == np.uint16 or lum.max() > 1.0:
+                    lum = lum / 65535.0 if lum.max() > 255.0 else lum / 255.0
+
+                if mode == "highlights":
+                    mask_calc = (lum >= 0.999)
+                else:
+                    mask_calc = (lum <= 0.001)
+
+                try:
+                    mask_u8 = np.ascontiguousarray(mask_calc.astype(np.uint8))
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                        mask_u8, connectivity=8
+                    )
+                    if num_labels > 1:
+                        areas = stats[1:, cv2.CC_STAT_AREA]
+                        top_idxs = np.argsort(areas)[::-1][:8]
+                        self._clipping_centroids = [
+                            QPointF(float(centroids[1 + i][0]), float(centroids[1 + i][1]))
+                            for i in top_idxs
+                        ]
+                    else:
+                        pts = np.argwhere(mask_calc)
+                        if len(pts) > 0:
+                            my, mx = np.mean(pts, axis=0)
+                            self._clipping_centroids = [QPointF(float(mx), float(my))]
+                        else:
+                            self._clipping_centroids = []
+                except Exception:
+                    pts = np.argwhere(mask_calc)
+                    if len(pts) > 0:
+                        my, mx = np.mean(pts, axis=0)
+                        self._clipping_centroids = [QPointF(float(mx), float(my))]
+                    else:
+                        self._clipping_centroids = []
+            else:
+                self._clipping_centroids = []
+        except Exception as e:
+            logging.error(f"Error setting clipping overlay mode: {e}", exc_info=True)
+            self._clipping_mask_pixmap = None
+            self._clipping_centroids = []
+
+        self._radar_start_time = time.monotonic()
+        if not self._radar_timer.isActive() and len(self._clipping_centroids) > 0:
+            self._radar_timer.start(25)
+
+        self.clipping_overlay_changed.emit(mode)
+        self.viewport().update()
+
+    def toggle_clipping_overlay(self, mode: str):
+        """Переключает режим подсветки (при повторном клике отключает)."""
+        if self.clipping_overlay_mode == mode:
+            self.set_clipping_overlay_mode(None)
+        else:
+            self.set_clipping_overlay_mode(mode)
+
     def reset_for_new_image(self):
         """Полный сброс состояния холста, оверлеев и буферов перед загрузкой нового файла."""
+        self.set_clipping_overlay_mode(None)
         self.set_split_view_active(False)
         self.clear_ruler()
         self.clear_psf_marker()
@@ -753,6 +933,8 @@ class AstroCanvas(QGraphicsView):
         if hasattr(self, 'status_overlay'):
             self.status_overlay.setVisible(True)
         self.zoomChanged.emit(self.get_current_zoom_str())
+        if getattr(self, 'clipping_overlay_mode', None) is not None:
+            self.set_clipping_overlay_mode(self.clipping_overlay_mode)
         self.viewport().update()
 
     def set_processed_image(self, img_float: np.ndarray):
@@ -771,6 +953,8 @@ class AstroCanvas(QGraphicsView):
             self.zoomChanged.emit(self.get_current_zoom_str())
         if hasattr(self, 'welcome_widget'):
             self.welcome_widget.setVisible(False)
+        if getattr(self, 'clipping_overlay_mode', None) is not None:
+            self.set_clipping_overlay_mode(self.clipping_overlay_mode)
         self.viewport().update()
 
     def show_welcome_state(self):
@@ -1507,6 +1691,10 @@ class AstroCanvas(QGraphicsView):
         img_top = min(top_left_vp.y(), bottom_right_vp.y())
         img_bottom = max(top_left_vp.y(), bottom_right_vp.y())
 
+        # Статическая векторная маска клиппинга (в координатах сцены / пикселей снимка)
+        if self.clipping_overlay_mode is not None and self._clipping_mask_pixmap is not None:
+            painter.drawPixmap(0, 0, self._clipping_mask_pixmap)
+
         painter.save()
         painter.resetTransform()
 
@@ -1927,6 +2115,39 @@ class AstroCanvas(QGraphicsView):
             loupe_text = f"{int(zoom)}x LOUPE" if float(zoom).is_integer() else f"{zoom:.1f}x LOUPE"
             tw = painter.fontMetrics().horizontalAdvance(loupe_text)
             painter.drawText(int(cx - tw / 2.0), int(cy + radius - 8), loupe_text)
+
+        # 4. Пульсирующая радарная анимация зон клиппинга (Sonar Ping Animation)
+        if self.clipping_overlay_mode is not None and self._clipping_centroids:
+            now = time.monotonic()
+            elapsed = now - getattr(self, '_radar_start_time', now)
+            cycle_duration = 1.2
+            phase1 = (elapsed % cycle_duration) / cycle_duration
+            phase2 = ((elapsed - 0.4) % cycle_duration) / cycle_duration
+
+            base_hex = "#00b0ff" if self.clipping_overlay_mode == "shadows" else "#ff1744"
+            base_color = QColor(base_hex)
+
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+            for scene_pt in self._clipping_centroids:
+                vp_pt = self.mapFromScene(scene_pt)
+                pt_f = QPointF(float(vp_pt.x()), float(vp_pt.y()))
+                if pt_f.x() < -60 or pt_f.x() > vp_w + 60 or pt_f.y() < -60 or pt_f.y() > vp_h + 60:
+                    continue
+
+                for phase in (phase1, phase2):
+                    r = 5.0 + 35.0 * phase
+                    alpha = int(round(240.0 * (1.0 - phase)))
+                    if alpha <= 0:
+                        continue
+                    ring_col = QColor(base_color)
+                    ring_col.setAlpha(max(0, min(240, alpha)))
+                    painter.setPen(QPen(ring_col, 2.0))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawEllipse(pt_f, r, r)
+
+            painter.restore()
 
         painter.restore()
 
@@ -2600,6 +2821,11 @@ class AstroCanvas(QGraphicsView):
             self.viewport().update()
 
         if event.key() == Qt.Key.Key_Escape:
+            if getattr(self, 'clipping_overlay_mode', None) is not None:
+                self.set_clipping_overlay_mode(None)
+                event.accept()
+                return
+
             if self._ruler_mode:
                 if (self._meas_submode == "disk" or getattr(self, 'active_mode', '') == "moon_disk") and (
                     self.disk_center is not None or self.temp_disk_rect is not None or self.pending_disk is not None or self._disk_draft_center is not None or self.disk_points or self._disk_points

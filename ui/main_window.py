@@ -502,6 +502,8 @@ class AstroRackWindow(QMainWindow):
         self.histogram_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.histogram_widget.setMinimumWidth(220)
         self.hist_header.attach_histogram(self.histogram)
+        self.histogram.clipping_overlay_requested.connect(self.canvas.toggle_clipping_overlay)
+        self.canvas.clipping_overlay_changed.connect(self.histogram.set_clipping_overlay_mode)
         rack_vbox.addWidget(self.hist_header)
         rack_vbox.addWidget(self.histogram)
 
@@ -1005,8 +1007,9 @@ class AstroRackWindow(QMainWindow):
         QShortcut(QKeySequence("Escape"), self, self._reset_active_tools)
 
     def _reset_active_tools(self):
-        """Полный сброс активного инструмента (ESC): отмена crop, лупы, профиля, psf, ruler и закрытие инспекторов."""
+        """Полный сброс активного инструмента (ESC): отмена crop, лупы, профиля, psf, ruler, клиппинга и закрытие инспекторов."""
         self.toolbox.clear_tool()
+        self.canvas.set_clipping_overlay_mode(None)
         self.canvas.reset_to_default_tool()
         self.canvas.clear_ruler()
         self.canvas.clear_psf_marker()
@@ -2207,17 +2210,8 @@ class AstroRackWindow(QMainWindow):
             img = self._current_processed_image
         if img is None or img.size == 0:
             return
-        h, w = img.shape[:2]
-        if h <= 0 or w <= 0:
-            return
-        total_px = h * w
-        if total_px > 65536:
-            step = max(1, int(np.sqrt(total_px / 65536)))
-            sample_img = img[::step, ::step]
-        else:
-            sample_img = img
         if hasattr(self, 'histogram') and self.histogram is not None:
-            self.histogram.update_histogram(sample_img)
+            self.histogram.update_histogram(img)
 
     def _on_split_toggled(self, active: bool):
         self.canvas.set_split_view_active(active)

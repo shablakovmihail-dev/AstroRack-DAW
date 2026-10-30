@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QButtonGroup
 )
 from PyQt6.QtGui import (
-    QPainter, QColor, QPen, QBrush, QPainterPath, QPalette, QFont, QCursor, QPolygonF,
+    QPainter, QColor, QPen, QBrush, QPainterPath, QPalette, QFont, QFontMetrics, QCursor, QPolygonF,
     QLinearGradient, QRadialGradient
 )
 from core.processing import AstroEngine
@@ -3598,6 +3598,86 @@ class ToolboxPanel(QFrame):
 # ПРОФЕССИОНАЛЬНЫЙ СПЕКТРО-ЯРКОСТНЫЙ АНАЛИЗАТОР (HISTOGRAM BLOCK)
 # =============================================================================
 
+COLOR_HIGHLIGHT_ACCENT = "#ff1744"
+COLOR_HIGHLIGHT_MASK = QColor(255, 23, 68, 200)
+COLOR_SHADOW_ACCENT = "#00b0ff"
+COLOR_SHADOW_MASK = QColor(0, 176, 255, 180)
+COLOR_CLIPPING_NEUTRAL = "#3a4454"
+
+
+def format_clipping_text(count: int, percent: float) -> str:
+    """
+    Форматирует текст индикатора клиппинга:
+    - Если count == 0: '0% (0 px)'
+    - Если count > 0 и percent < 0.01%: '< 0.01% (N px)', где N — точное число физических пикселей
+    - Если percent >= 0.01%: '{percent:.3f}% ({count:,} px)'
+    """
+    if count == 0:
+        return "0% (0 px)"
+    elif percent < 0.01:
+        return f"< 0.01% ({count} px)"
+    else:
+        return f"{percent:.3f}% ({count:,} px)"
+
+
+def compute_clipping_metrics(img: np.ndarray, roi_mask: Optional[np.ndarray] = None) -> dict:
+    """
+    Точный векторный расчёт выбитых пикселей:
+    - Shadows: brightness <= 0.001
+    - Highlights: brightness >= 0.999
+    """
+    if img is None or img.size == 0:
+        return {
+            'shadow_count': 0,
+            'shadow_pct': 0.0,
+            'shadow_clip': False,
+            'highlight_count': 0,
+            'highlight_pct': 0.0,
+            'highlight_clip': False,
+            'total_pixels': 0,
+        }
+
+    is_float = np.issubdtype(img.dtype, np.floating)
+    if img.ndim == 3 and img.shape[2] >= 3:
+        r = img[:, :, 0].astype(np.float32)
+        g = img[:, :, 1].astype(np.float32)
+        b = img[:, :, 2].astype(np.float32)
+        if not is_float or img.max() > 1.0:
+            r = r / 255.0
+            g = g / 255.0
+            b = b / 255.0
+        lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    else:
+        mono = img[:, :, 0] if (img.ndim == 3 and img.shape[2] == 1) else img
+        lum = mono.astype(np.float32)
+        if not is_float or img.max() > 1.0:
+            lum = lum / 255.0
+
+    if roi_mask is not None and np.any(roi_mask):
+        calc_lum = lum[roi_mask > 0]
+        if calc_lum.size == 0:
+            calc_lum = lum.ravel()
+    else:
+        calc_lum = lum.ravel()
+
+    total_px = max(1, calc_lum.size)
+    shadow_count = int(np.count_nonzero(calc_lum <= 0.001))
+    shadow_pct = (shadow_count / float(total_px)) * 100.0
+
+    highlight_count = int(np.count_nonzero(calc_lum >= 0.999))
+    highlight_pct = (highlight_count / float(total_px)) * 100.0
+
+    return {
+        'shadow_count': shadow_count,
+        'shadow_pct': shadow_pct,
+        'shadow_clip': shadow_count > 0,
+        'highlight_count': highlight_count,
+        'highlight_pct': highlight_pct,
+        'highlight_clip': highlight_count > 0,
+        'total_pixels': total_px,
+    }
+
+
 class AstroHistogramHeader(QFrame):
     """Шапка блока гистограммы с переключателями [FULL|AUTO], [LOG|LIN], [LUM|RGB] и кнопкой справки [?]."""
 
@@ -3712,7 +3792,12 @@ class AstroHistogramHeader(QFrame):
         self.btn_help = QPushButton("?")
         self.btn_help.setFixedSize(16, 18)
         self.btn_help.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_help.setToolTip("Справка по профессиональному чтению гистограммы")
+        self.btn_help.setToolTip(
+            "Гистограмма распределения яркости (Luminance Histogram):\n"
+            "Отображает динамический диапазон текущего 16-битного кадра.\n"
+            "• Кнопки индикаторов клиппинга (слева — тени, справа — светы) показывают точный процент и физическое количество выбитых пикселей.\n"
+            "• Клик по любому из индикаторов запускает интерактивный поиск зон клиппинга прямо на снимке, подсвечивая проблемные участки пульсирующими радарными кругами."
+        )
         self.btn_help.clicked.connect(self._open_help_dialog)
         layout.addWidget(self.btn_help)
 
@@ -3861,6 +3946,7 @@ class AstroHistogramHeader(QFrame):
 
 class AstroHistogramWidget(QWidget):
     """Профессиональный спектро-яркостный анализатор с LOG/LIN, RGB, LED-клиппингом и визирами."""
+    clipping_overlay_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3893,8 +3979,14 @@ class AstroHistogramWidget(QWidget):
 
         self._shadow_clip = False
         self._shadow_clip_pct = 0.0
+        self._shadow_count = 0
         self._highlight_clip = False
         self._highlight_clip_pct = 0.0
+        self._highlight_count = 0
+
+        self._clipping_overlay_mode = None  # None | "shadows" | "highlights"
+        self._hover_shadow = False
+        self._hover_highlight = False
 
         self._black_point_norm = 0.0
         self._black_point_enabled = False
@@ -3907,8 +3999,13 @@ class AstroHistogramWidget(QWidget):
         self._last_img = None
         self._shadow_clip = False
         self._shadow_clip_pct = 0.0
+        self._shadow_count = 0
         self._highlight_clip = False
         self._highlight_clip_pct = 0.0
+        self._highlight_count = 0
+        self._clipping_overlay_mode = None
+        self._hover_shadow = False
+        self._hover_highlight = False
         self._raw_hist_lum.fill(0.0)
         self._raw_hist_r.fill(0.0)
         self._raw_hist_g.fill(0.0)
@@ -3918,6 +4015,29 @@ class AstroHistogramWidget(QWidget):
         self._hist_g.fill(0.0)
         self._hist_b.fill(0.0)
         self.update()
+
+    def set_clipping_overlay_mode(self, mode: Optional[str]):
+        """Синхронизирует состояние нажатия индикаторов с холстом."""
+        if mode not in ("shadows", "highlights", None):
+            mode = None
+        if self._clipping_overlay_mode != mode:
+            self._clipping_overlay_mode = mode
+            self.update()
+
+    def get_clipping_overlay_mode(self) -> Optional[str]:
+        return self._clipping_overlay_mode
+
+    def get_shadow_count(self) -> int:
+        return self._shadow_count
+
+    def get_highlight_count(self) -> int:
+        return self._highlight_count
+
+    def get_shadow_text(self) -> str:
+        return format_clipping_text(self._shadow_count, self._shadow_clip_pct)
+
+    def get_highlight_text(self) -> str:
+        return format_clipping_text(self._highlight_count, self._highlight_clip_pct)
 
     def set_roi_mode(self, mode: str):
         """Устанавливает режим выборки данных ('FULL' или 'AUTO')."""
@@ -3945,7 +4065,7 @@ class AstroHistogramWidget(QWidget):
         if total_px <= 0:
             return
 
-        # Быстрый даунсэмплинг при необходимости (>65536 px)
+        # Быстрый даунсэмплинг при необходимости (>65536 px) для построения кривых
         if total_px > 65536:
             step = max(1, int(np.sqrt(total_px / 65536)))
             sample = img[::step, ::step]
@@ -3986,6 +4106,7 @@ class AstroHistogramWidget(QWidget):
         # Выделение полезного сигнала объекта в режиме AUTO (Auto-Mask ROI)
         use_mask = False
         mask = None
+        full_mask = None
         if self._roi_mode == "AUTO":
             gray_u8 = np.clip(lum_255, 0.0, 255.0).astype(np.uint8)
             try:
@@ -4004,6 +4125,10 @@ class AstroHistogramWidget(QWidget):
                         cv2.drawContours(mask, [c], -1, 255, thickness=-1)
                         if np.any(mask > 0):
                             use_mask = True
+                            if total_px > 65536:
+                                full_mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+                            else:
+                                full_mask = mask
             except Exception:
                 use_mask = False
 
@@ -4033,33 +4158,21 @@ class AstroHistogramWidget(QWidget):
             self._raw_hist_g, _ = np.histogram(g_data, bins=256, range=(0, 256))
             self._raw_hist_b, _ = np.histogram(b_data, bins=256, range=(0, 256))
             self._raw_hist_lum, _ = np.histogram(lum_data, bins=256, range=(0, 256))
-
-            n_samples = max(1, lum_data.size)
-            # Shadow clip: строго 0 (порог 0.05% кадра)
-            shadow_px = int(np.sum(lum_data <= 0.05))
-            self._shadow_clip_pct = (shadow_px / float(n_samples)) * 100.0
-            self._shadow_clip = self._shadow_clip_pct > 0.05
-
-            # Highlight clip: пережог 255
-            hl_px = int(np.sum(lum_data >= 254.95))
-            hl_px_rgb = max(int(np.sum(r_data >= 254.95)), int(np.sum(g_data >= 254.95)), int(np.sum(b_data >= 254.95)))
-            effective_hl_px = max(hl_px, hl_px_rgb)
-            self._highlight_clip_pct = (effective_hl_px / float(n_samples)) * 100.0
-            self._highlight_clip = effective_hl_px > 0
         else:
             self._raw_hist_lum, _ = np.histogram(lum_data, bins=256, range=(0, 256))
             self._raw_hist_r = self._raw_hist_lum.copy()
             self._raw_hist_g = self._raw_hist_lum.copy()
             self._raw_hist_b = self._raw_hist_lum.copy()
 
-            n_samples = max(1, lum_data.size)
-            shadow_px = int(np.sum(lum_data <= 0.05))
-            self._shadow_clip_pct = (shadow_px / float(n_samples)) * 100.0
-            self._shadow_clip = self._shadow_clip_pct > 0.05
+        # Точный векторный расчёт выбитых пикселей на полном разрешении кадра
+        metrics = compute_clipping_metrics(img, roi_mask=full_mask if use_mask else None)
+        self._shadow_count = metrics['shadow_count']
+        self._shadow_clip_pct = metrics['shadow_pct']
+        self._shadow_clip = metrics['shadow_clip']
 
-            hl_px = int(np.sum(lum_data >= 254.95))
-            self._highlight_clip_pct = (hl_px / float(n_samples)) * 100.0
-            self._highlight_clip = hl_px > 0
+        self._highlight_count = metrics['highlight_count']
+        self._highlight_clip_pct = metrics['highlight_pct']
+        self._highlight_clip = metrics['highlight_clip']
 
         self._has_data = True
         self._recompute_normalized_curves()
@@ -4128,6 +4241,76 @@ class AstroHistogramWidget(QWidget):
     def apply_theme(self, theme: dict):
         state = theme.get('name', 'A')
         self.set_state_ab(state)
+
+    def get_shadow_rect(self) -> QRectF:
+        w = float(self.width())
+        # Рассчитываем ширину по тексту счетчика или фиксированную компактную
+        f_cnt = QFont("Consolas", 7)
+        fm = QFontMetrics(f_cnt)
+        txt = self.get_shadow_text()
+        text_w = float(fm.horizontalAdvance(txt))
+        # 6px отступ слева + 6px точка + 6px промежуток + text_w + 8px отступ справа
+        btn_w = max(90.0, min(140.0, text_w + 26.0))
+        btn_w = min(btn_w, (w - 16.0) * 0.48)
+        return QRectF(4.0, 4.0, btn_w, 18.0)
+
+    def get_highlight_rect(self) -> QRectF:
+        w = float(self.width())
+        f_cnt = QFont("Consolas", 7)
+        fm = QFontMetrics(f_cnt)
+        txt = self.get_highlight_text()
+        text_w = float(fm.horizontalAdvance(txt))
+        btn_w = max(90.0, min(140.0, text_w + 26.0))
+        btn_w = min(btn_w, (w - 16.0) * 0.48)
+        return QRectF(w - btn_w - 4.0, 4.0, btn_w, 18.0)
+
+    def _is_in_shadow_zone(self, pos: Union[QPoint, QPointF]) -> bool:
+        h = float(self.height())
+        p = QPointF(pos)
+        return self.get_shadow_rect().contains(p) or QRectF(0.0, h - 22.0, 90.0, 22.0).contains(p)
+
+    def _is_in_highlight_zone(self, pos: Union[QPoint, QPointF]) -> bool:
+        w, h = float(self.width()), float(self.height())
+        p = QPointF(pos)
+        return self.get_highlight_rect().contains(p) or QRectF(w - 90.0, h - 22.0, 90.0, 22.0).contains(p)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position()
+            if self._is_in_shadow_zone(pos):
+                self.clipping_overlay_requested.emit("shadows")
+                event.accept()
+                return
+            elif self._is_in_highlight_zone(pos):
+                self.clipping_overlay_requested.emit("highlights")
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        in_shadow = self._is_in_shadow_zone(pos)
+        in_hl = self._is_in_highlight_zone(pos)
+
+        if in_shadow or in_hl:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        if in_shadow != self._hover_shadow or in_hl != self._hover_highlight:
+            self._hover_shadow = in_shadow
+            self._hover_highlight = in_hl
+            self.update()
+
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        if self._hover_shadow or self._hover_highlight:
+            self._hover_shadow = False
+            self._hover_highlight = False
+            self.update()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().leaveEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -4231,42 +4414,112 @@ class AstroHistogramWidget(QWidget):
                 painter.setPen(QPen(QColor("#94A3B8"), 1.0, Qt.PenStyle.DashLine))
                 painter.drawLine(int(wx), int(y_top), int(wx), int(y_base))
 
-        # 5. Светодиодные индикаторы клиппинга
-        # Левый LED: Under-exposure / Shadows Clip (x=12, y=12, dot 6x6)
-        lx, ly = 12.0, 12.0
-        if self.isEnabled() and self._has_data and self._shadow_clip:
-            halo = QRadialGradient(lx, ly, 8.0)
-            halo.setColorAt(0.0, QColor(0, 229, 255, 180))
-            halo.setColorAt(0.5, QColor(56, 189, 248, 80))
-            halo.setColorAt(1.0, QColor(0, 229, 255, 0))
-            painter.fillRect(QRectF(lx - 8, ly - 8, 16, 16), QBrush(halo))
+        # 5. Интерактивные кнопки-индикаторы клиппинга
+        left_rect = self.get_shadow_rect()
+        right_rect = self.get_highlight_rect()
+
+        shadow_active = self.isEnabled() and self._has_data and (self._shadow_count > 0)
+        shadow_checked = (self._clipping_overlay_mode == "shadows")
+        hl_active = self.isEnabled() and self._has_data and (self._highlight_count > 0)
+        hl_checked = (self._clipping_overlay_mode == "highlights")
+
+        # 5.1 Левый индикатор (Shadows / Underflow)
+        painter.save()
+        if shadow_checked:
+            # Активное состояние (Sonar включен): плотный темный полупрозрачный фон rgba(14, 18, 25, 0.88)
+            # экранирует кривую графика под текстом, акцентная рамка #00e5ff
+            bg_brush = QBrush(QColor(14, 18, 25, 224))
+            border_pen = QPen(QColor("#00e5ff"), 1.0)
+        elif self._hover_shadow:
+            # Hover: background-color: rgba(20, 24, 32, 0.75); border: 1px solid #30363d;
+            bg_brush = QBrush(QColor(20, 24, 32, 191))
+            border_pen = QPen(QColor("#30363d"), 1.0)
+        else:
+            # В покое: background: transparent; border: none;
+            bg_brush = Qt.BrushStyle.NoBrush
+            border_pen = Qt.PenStyle.NoPen
+
+        left_path = QPainterPath()
+        left_path.addRoundedRect(left_rect, 4.0, 4.0)
+        if bg_brush != Qt.BrushStyle.NoBrush:
+            painter.fillPath(left_path, bg_brush)
+        if border_pen != Qt.PenStyle.NoPen:
+            painter.strokePath(left_path, border_pen)
+
+        lx = left_rect.x() + 9.0
+        ly = left_rect.center().y()
+        if shadow_active:
+            halo = QRadialGradient(lx, ly, 7.0)
+            halo.setColorAt(0.0, QColor(0, 176, 255, 180))
+            halo.setColorAt(0.5, QColor(0, 176, 255, 60))
+            halo.setColorAt(1.0, QColor(0, 176, 255, 0))
+            painter.fillRect(QRectF(lx - 7, ly - 7, 14, 14), QBrush(halo))
 
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor("#00E5FF")))
-            painter.drawEllipse(QRectF(lx - 3, ly - 3, 6, 6))
+            painter.setBrush(QBrush(QColor(COLOR_SHADOW_ACCENT)))
+            painter.drawEllipse(QRectF(lx - 2.5, ly - 2.5, 5, 5))
         else:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor("#334155")))
-            painter.drawEllipse(QRectF(lx - 3, ly - 3, 6, 6))
+            painter.setBrush(QBrush(QColor(COLOR_CLIPPING_NEUTRAL)))
+            painter.drawEllipse(QRectF(lx - 2.5, ly - 2.5, 5, 5))
 
-        # Правый LED: Over-exposure / Highlights Clip (x=w-12, y=12, dot 6x6)
-        rx, ry = w - 12.0, 12.0
-        if self.isEnabled() and self._has_data and self._highlight_clip:
-            halo = QRadialGradient(rx, ry, 8.0)
-            halo.setColorAt(0.0, QColor(239, 68, 68, 180))
-            halo.setColorAt(0.5, QColor(239, 68, 68, 80))
-            halo.setColorAt(1.0, QColor(239, 68, 68, 0))
-            painter.fillRect(QRectF(rx - 8, ry - 8, 16, 16), QBrush(halo))
+        # Текст левого индикатора: компактно в одну строку без верхнего заголовка "0 (Shadows)"
+        painter.setFont(QFont("Consolas", 7))
+        col_cnt = QColor("#00e5ff") if shadow_checked else (QColor(COLOR_SHADOW_ACCENT) if shadow_active else QColor("#64748b"))
+        painter.setPen(col_cnt)
+        text_rect_left = QRectF(left_rect.x() + 18.0, left_rect.y(), left_rect.width() - 20.0, left_rect.height())
+        painter.drawText(text_rect_left, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.get_shadow_text())
+        painter.restore()
+
+        # 5.2 Правый индикатор (Highlights / Peaks)
+        painter.save()
+        if hl_checked:
+            # Активное состояние (Sonar включен): плотный темный полупрозрачный фон rgba(14, 18, 25, 0.88)
+            # экранирует кривую графика под текстом, акцентная рамка #ff3344
+            bg_brush = QBrush(QColor(14, 18, 25, 224))
+            border_pen = QPen(QColor("#ff3344"), 1.0)
+        elif self._hover_highlight:
+            # Hover: background-color: rgba(20, 24, 32, 0.75); border: 1px solid #30363d;
+            bg_brush = QBrush(QColor(20, 24, 32, 191))
+            border_pen = QPen(QColor("#30363d"), 1.0)
+        else:
+            # В покое: background: transparent; border: none;
+            bg_brush = Qt.BrushStyle.NoBrush
+            border_pen = Qt.PenStyle.NoPen
+
+        right_path = QPainterPath()
+        right_path.addRoundedRect(right_rect, 4.0, 4.0)
+        if bg_brush != Qt.BrushStyle.NoBrush:
+            painter.fillPath(right_path, bg_brush)
+        if border_pen != Qt.PenStyle.NoPen:
+            painter.strokePath(right_path, border_pen)
+
+        rx = right_rect.right() - 9.0
+        ry = right_rect.center().y()
+        if hl_active:
+            halo = QRadialGradient(rx, ry, 7.0)
+            halo.setColorAt(0.0, QColor(255, 23, 68, 180))
+            halo.setColorAt(0.5, QColor(255, 23, 68, 60))
+            halo.setColorAt(1.0, QColor(255, 23, 68, 0))
+            painter.fillRect(QRectF(rx - 7, ry - 7, 14, 14), QBrush(halo))
 
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor("#EF4444")))
-            painter.drawEllipse(QRectF(rx - 3, ry - 3, 6, 6))
+            painter.setBrush(QBrush(QColor(COLOR_HIGHLIGHT_ACCENT)))
+            painter.drawEllipse(QRectF(rx - 2.5, ry - 2.5, 5, 5))
         else:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor("#334155")))
-            painter.drawEllipse(QRectF(rx - 3, ry - 3, 6, 6))
+            painter.setBrush(QBrush(QColor(COLOR_CLIPPING_NEUTRAL)))
+            painter.drawEllipse(QRectF(rx - 2.5, ry - 2.5, 5, 5))
 
-        # 6. Подписи шкалы яркости
+        # Текст правого индикатора: компактно в одну строку без верхнего заголовка "255 (Peaks)"
+        painter.setFont(QFont("Consolas", 7))
+        col_hl_cnt = QColor("#ff3344") if hl_checked else (QColor(COLOR_HIGHLIGHT_ACCENT) if hl_active else QColor("#64748b"))
+        painter.setPen(col_hl_cnt)
+        text_rect_right = QRectF(right_rect.x() + 4.0, right_rect.y(), right_rect.width() - 22.0, right_rect.height())
+        painter.drawText(text_rect_right, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, self.get_highlight_text())
+        painter.restore()
+
+        # 6. Подписи шкалы яркости у базовой линии
         painter.setPen(QPen(QColor("#475569")))
         painter.setFont(QFont("Consolas", 8))
         painter.drawText(6, int(h - 3), "0 (Shadows)")
@@ -4277,21 +4530,24 @@ class AstroHistogramWidget(QWidget):
         """Интерактивные тултипы для светодиодов клиппинга и рабочей области."""
         if event.type() == QEvent.Type.ToolTip:
             pos = event.pos()
-            x, y = pos.x(), pos.y()
-            w = self.width()
 
-            if x <= 28 and y <= 24:
-                if self._shadow_clip:
-                    tip = f"Shadow Clipping: {self._shadow_clip_pct:.2f}% пикселей потеряно в чистом нуле (провал деталей фона)"
-                else:
-                    tip = "Shadows: No clipping (чистый фон сохранён)"
+            if self._is_in_shadow_zone(pos):
+                tip = (
+                    "Индикатор клиппинга теней (Underflow / Чернота).\n"
+                    "• Физический смысл: показывает потерю информации в тенях (пиксели с яркостью 0.0). "
+                    "Значительный клиппинг делает фон неестественно проваленным и съедает слабые детали "
+                    "(пепельный свет Луны, внешние кольца Сатурна).\n"
+                    "• Действие: НАЖМИТЕ НА ИНДИКАТОР, чтобы подсветить потерянные зоны на холсте лазурным цветом с анимацией радара."
+                )
                 QToolTip.showText(event.globalPos(), tip, self)
                 return True
-            elif x >= w - 28 and y <= 24:
-                if self._highlight_clip:
-                    tip = f"Highlight Clipping (Пережог): {self._highlight_clip_pct:.2f}% пикселей насыщены до 255 (потеря текстуры в ярких зонах / кратерах)"
-                else:
-                    tip = "Highlights: No clipping (динамический диапазон в норме)"
+            elif self._is_in_highlight_zone(pos):
+                tip = (
+                    "Индикатор клиппинга светов (Overflow / Пересвет).\n"
+                    "• Физический смысл: показывает зоны насыщения матрицы (яркость 1.0 / 255). "
+                    "В этих зонах информация о рельефе полностью утрачена (выгорание центральных пиков кратеров или освещённого лимба).\n"
+                    "• Действие: НАЖМИТЕ НА ИНДИКАТОР, чтобы локализовать зоны выгорания на снимке красной радарной пульсацией."
+                )
                 QToolTip.showText(event.globalPos(), tip, self)
                 return True
             else:
