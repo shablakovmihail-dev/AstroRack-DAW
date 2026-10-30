@@ -1,4 +1,4 @@
-# AstroRack DAW v7.0 — Lunar, Planetary & Deep-Sky Image Mastering Platform
+# AstroRack DAW v8.3.6 — Lunar, Planetary & Deep-Sky Image Mastering Platform
 # Точка входа в приложение.
 
 import os
@@ -15,7 +15,7 @@ from ui.main_window import AstroRackWindow
 def main():
     # 0. Регистрация AppUserModelID для Windows, чтобы иконка закреплялась в таскбаре
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('astrorack.daw.processor.v7')
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('astrorack.daw.processor.v8.3.6')
     except Exception:
         pass
 

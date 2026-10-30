@@ -69,7 +69,7 @@ class AboutDialog(QDialog):
         title_col = QVBoxLayout()
         title_col.setSpacing(2)
 
-        lbl_title = QLabel("AstroRack DAW v7.0")
+        lbl_title = QLabel("AstroRack DAW v8.3.6")
         lbl_title.setStyleSheet("""
             font-size: 20px;
             font-weight: 800;

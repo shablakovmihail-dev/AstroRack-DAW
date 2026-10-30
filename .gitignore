@@ -10,7 +10,6 @@ __pycache__/
 build/
 dist/
 *.manifest
-*.spec
 
 # Unit test / coverage reports
 .pytest_cache/
@@ -43,6 +42,10 @@ ENV/
 temp/
 cache/
 *.tmp
+
+# Preserved built-in demo sample assets
+!samples/
+!samples/**
 
 # OS generated files
 Thumbs.db

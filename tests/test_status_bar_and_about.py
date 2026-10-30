@@ -27,7 +27,7 @@ class TestStatusBarAndAbout(unittest.TestCase):
         # Проверяем тексты внутри окна
         labels = [lbl.text() for lbl in dlg.findChildren(QLabel)]
         has_title = any("AstroRack DAW" in t for t in labels)
-        has_version = any("v7.0" in t for t in labels)
+        has_version = any("v8.3.6" in t for t in labels)
         has_license = any("Public Domain" in t or "Zero Rights Reserved" in t for t in labels)
         has_pyqt = any("PyQt6" in t for t in labels)
         has_opencv = any("OpenCV" in t for t in labels)
@@ -35,7 +35,7 @@ class TestStatusBarAndAbout(unittest.TestCase):
         has_epoch = any("Epoch J2026.10" in t for t in labels)
 
         self.assertTrue(has_title, "AstroRack DAW title missing")
-        self.assertTrue(has_version, "v7.0 badge missing")
+        self.assertTrue(has_version, "v8.3.6 badge missing")
         self.assertTrue(has_license, "Public domain manifesto missing")
         self.assertTrue(has_pyqt, "PyQt6 tech badge missing")
         self.assertTrue(has_opencv, "OpenCV tech badge missing")
@@ -86,6 +86,9 @@ class TestStatusBarAndAbout(unittest.TestCase):
         win = AstroRackWindow()
         win.show()
         QApplication.processEvents()
+
+        # Проверяем заголовок окна строго по спецификации релиза
+        self.assertEqual(win.windowTitle(), "AstroRack DAW v8.3.6 — Lunar & Planetary Processor")
 
         # Проверяем наличие секций статус-бара
         self.assertTrue(hasattr(win, 'lbl_sb_pipeline'))

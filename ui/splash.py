@@ -10,7 +10,7 @@ from utils.file_io import get_resource_path
 
 
 class AstroSplashScreen(QSplashScreen):
-    """Сплэш-скрин AstroRack DAW v7.0 с анимацией загрузки, крупным логотипом и плавным затуханием (fade out)."""
+    """Сплэш-скрин AstroRack DAW v8.3.6 с анимацией загрузки, крупным логотипом и плавным затуханием (fade out)."""
 
     def __init__(self):
         super().__init__()
@@ -75,7 +75,7 @@ class AstroSplashScreen(QSplashScreen):
         """)
         title_row.addWidget(lbl_title)
 
-        lbl_badge = QLabel("v7.0")
+        lbl_badge = QLabel("v8.3.6")
         lbl_badge.setStyleSheet("""
             background-color: #14383c;
             color: #00fff2;

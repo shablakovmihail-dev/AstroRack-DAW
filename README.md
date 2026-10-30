@@ -1,4 +1,4 @@
-# AstroRack DAW v7.0 🪐🎛️
+# AstroRack DAW v8.3.6 🪐🎛️
 
 > **Desktop Digital Audio Workstation-style Lunar & Planetary Astrophotography Post-Processor.**
 

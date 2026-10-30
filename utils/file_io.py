@@ -27,6 +27,10 @@ def get_resource_path(relative_path: str = "") -> str:
     return base_dir
 
 
+# Универсальный алиас функции для безопасного доступа к ресурсам с учетом sys._MEIPASS
+resource_path = get_resource_path
+
+
 def load_image(file_path: str) -> np.ndarray:
     """
     Загружает изображение в формате float32 [0.0, 1.0] в цветовом пространстве RGB или Grayscale.
