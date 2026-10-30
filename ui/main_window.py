@@ -531,12 +531,6 @@ class AstroRackWindow(QMainWindow):
         self.btn_copy_ba.clicked.connect(self._copy_b_to_a)
 
         ab_hbox.addWidget(self.btn_state_toggle, stretch=1)
-
-        sep_ab = QFrame()
-        sep_ab.setFrameShape(QFrame.Shape.VLine)
-        sep_ab.setStyleSheet("background-color: #363648; width: 1px; margin: 2px 2px;")
-        ab_hbox.addWidget(sep_ab)
-
         ab_hbox.addWidget(self.btn_copy_ab)
         ab_hbox.addWidget(self.btn_copy_ba)
         rack_vbox.addWidget(ab_widget)
