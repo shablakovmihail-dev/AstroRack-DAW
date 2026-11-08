@@ -5,6 +5,7 @@ from .enhance import apply_local_contrast, apply_color_engine
 from .pipeline import PipelineWorker
 from .lunar_distance import calculate_lunar_distance, DEFAULT_LUNAR_DISTANCE_KM
 from .metadata_reader import extract_capture_date
+from .constants import LUNAR_CRATERS
 
 __all__ = [
     '__version__',
@@ -17,4 +18,5 @@ __all__ = [
     'calculate_lunar_distance',
     'DEFAULT_LUNAR_DISTANCE_KM',
     'extract_capture_date',
+    'LUNAR_CRATERS',
 ]

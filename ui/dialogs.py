@@ -1,12 +1,15 @@
 """Диалоговые окна приложения AstroRack DAW."""
 import os
+import math
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QFrame, QWidget, QScrollArea
+    QPushButton, QFrame, QWidget, QScrollArea,
+    QComboBox, QDoubleSpinBox
 )
 from PyQt6.QtGui import QFont, QDesktopServices, QPixmap, QIcon
 from utils.file_io import get_resource_path
+from core.constants import LUNAR_CRATERS, DEFAULT_LUNAR_DISTANCE_KM
 
 
 class AboutDialog(QDialog):
@@ -737,4 +740,177 @@ class HistogramHelpDialog(QDialog):
             event.accept()
             return
         super().keyPressEvent(event)
+
+
+class CraterCalibrationDialog(QDialog):
+    """Диалог калибровки масштаба линейки по известному диаметру лунного кратера."""
+
+    def __init__(self, current_px_length: float, parent=None, lunar_distance_km: float = DEFAULT_LUNAR_DISTANCE_KM):
+        super().__init__(parent)
+        self.setWindowTitle("Калибровка масштаба по кратеру")
+        self.setFixedSize(420, 360)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
+
+        self.current_px_length = max(0.1, float(current_px_length))
+        self.lunar_distance_km = max(100000.0, float(lunar_distance_km))
+        self._scale_km_per_px = 0.0
+        self._scale_arcsec_per_px = 0.0
+
+        self.setStyleSheet("""
+            CraterCalibrationDialog {
+                background-color: #161922;
+                color: #f1f5f9;
+            }
+            QLabel {
+                background: transparent;
+                background-color: transparent;
+                color: #cbd5e1;
+                font-size: 12px;
+            }
+            QComboBox, QDoubleSpinBox {
+                background-color: #1e2436;
+                color: #00e5ff;
+                border: 1px solid #2a3441;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QComboBox:focus, QDoubleSpinBox:focus {
+                border: 1px solid #00fff2;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #161922;
+                color: #e2e8f0;
+                selection-background-color: #00adb5;
+                selection-color: #111114;
+                border: 1px solid #2a3441;
+            }
+            QFrame#cardFrame {
+                background-color: #12141c;
+                border: 1px solid #252b38;
+                border-radius: 6px;
+                padding: 8px;
+            }
+            QPushButton#btnApply {
+                background-color: #00adb5;
+                color: #111114;
+                border: none;
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 6px 16px;
+            }
+            QPushButton#btnApply:hover {
+                background-color: #00fff2;
+            }
+            QPushButton#btnCancel {
+                background-color: #242938;
+                color: #cbd5e1;
+                border: 1px solid #384259;
+                border-radius: 4px;
+                font-size: 12px;
+                padding: 6px 14px;
+            }
+            QPushButton#btnCancel:hover {
+                background-color: #dc2626;
+                color: #ffffff;
+                border-color: #ef4444;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        lbl_header = QLabel("Калибровка линейки по кратеру")
+        lbl_header.setStyleSheet("background: transparent; background-color: transparent; color: #00e5ff; font-size: 14px; font-weight: bold;")
+        layout.addWidget(lbl_header)
+
+        # Селектор кратеров
+        row_crater = QHBoxLayout()
+        lbl_crater = QLabel("Эталонный кратер:")
+        row_crater.addWidget(lbl_crater)
+        self.combo_craters = QComboBox()
+        for name in LUNAR_CRATERS.keys():
+            self.combo_craters.addItem(name)
+        self.combo_craters.addItem("Custom (Ручной ввод)")
+        row_crater.addWidget(self.combo_craters)
+        layout.addLayout(row_crater)
+
+        # Ввод диаметра в км
+        row_dia = QHBoxLayout()
+        lbl_dia = QLabel("Диаметр кратера:")
+        row_dia.addWidget(lbl_dia)
+        self.spin_diameter = QDoubleSpinBox()
+        self.spin_diameter.setRange(0.1, 100000.0)
+        self.spin_diameter.setDecimals(1)
+        self.spin_diameter.setSuffix(" км")
+        self.spin_diameter.setValue(LUNAR_CRATERS.get("Tycho", 85.0))
+        row_dia.addWidget(self.spin_diameter)
+        layout.addLayout(row_dia)
+
+        # Карточка текущих параметров и расчёта
+        calc_card = QFrame()
+        calc_card.setObjectName("cardFrame")
+        card_layout = QVBoxLayout(calc_card)
+        card_layout.setSpacing(6)
+
+        self.lbl_px_disp = QLabel(f"Текущий замер: <b>{self.current_px_length:.1f} px</b>")
+        card_layout.addWidget(self.lbl_px_disp)
+
+        self.lbl_scale_km = QLabel("Масштаб: <b>— км/пикс</b>")
+        card_layout.addWidget(self.lbl_scale_km)
+
+        self.lbl_scale_arcsec = QLabel("Угловой масштаб: <b>— \"/пикс</b>")
+        card_layout.addWidget(self.lbl_scale_arcsec)
+        layout.addWidget(calc_card)
+
+        layout.addStretch()
+
+        # Кнопки диалога
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        self.btn_cancel = QPushButton("Отмена")
+        self.btn_cancel.setObjectName("btnCancel")
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_box.addWidget(self.btn_cancel)
+
+        self.btn_apply = QPushButton("Применить калибровку")
+        self.btn_apply.setObjectName("btnApply")
+        self.btn_apply.clicked.connect(self.accept)
+        btn_box.addWidget(self.btn_apply)
+        layout.addLayout(btn_box)
+
+        self.combo_craters.currentTextChanged.connect(self._on_crater_changed)
+        self.spin_diameter.valueChanged.connect(self._recalculate)
+
+        self._recalculate()
+
+    def _on_crater_changed(self, text: str):
+        if text in LUNAR_CRATERS:
+            self.spin_diameter.blockSignals(True)
+            self.spin_diameter.setValue(LUNAR_CRATERS[text])
+            self.spin_diameter.blockSignals(False)
+        self._recalculate()
+
+    def _recalculate(self):
+        dia_km = self.spin_diameter.value()
+        self._scale_km_per_px = dia_km / self.current_px_length if self.current_px_length > 0 else 0.0
+        # arcsec/px = (km_per_px / 384400) * (180 * 3600 / pi)
+        self._scale_arcsec_per_px = (self._scale_km_per_px / self.lunar_distance_km) * (180.0 * 3600.0 / math.pi)
+        self.lbl_scale_km.setText(f"Масштаб: <b style='color:#00fff2;'>{self._scale_km_per_px:.4f} км/пикс</b>")
+        self.lbl_scale_arcsec.setText(f"Угловой масштаб: <b style='color:#00fff2;'>{self._scale_arcsec_per_px:.3f}\"/пикс</b>")
+
+    @property
+    def scale_km_per_px(self) -> float:
+        return self._scale_km_per_px
+
+    @property
+    def scale_arcsec_per_px(self) -> float:
+        return self._scale_arcsec_per_px
+
+    @property
+    def crater_name(self) -> str:
+        return self.combo_craters.currentText()
 

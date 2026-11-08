@@ -10,7 +10,7 @@ import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF, QTimer, QPoint, QRect
 from PyQt6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsItem, QLabel,
-    QFrame, QVBoxLayout, QHBoxLayout, QPushButton, QMenu
+    QFrame, QVBoxLayout, QHBoxLayout, QPushButton, QMenu, QDialog
 )
 from PyQt6.QtGui import (
     QImage, QPixmap, QPainter, QColor, QFont, QPen, QBrush,
@@ -25,6 +25,7 @@ from core.geometry_calc import (
     calculate_spherical_correction,
     calculate_crater_ellipse
 )
+from .dialogs import CraterCalibrationDialog
 from utils.file_io import get_resource_path
 
 
@@ -632,6 +633,7 @@ class AstroCanvas(QGraphicsView):
         self._telescope_focal_len = 1000.0
         self._telescope_pixel_size = 3.76
         self._lunar_distance_km = 384400.0
+        self._custom_scale_km_per_px = None
         self._ruler_unit = "all"
 
         # Служебные структуры для диска Луны и эллипса кратера (с защитой состояния)
@@ -729,6 +731,8 @@ class AstroCanvas(QGraphicsView):
         self.measurement_hud.disk_method_changed.connect(self.set_disk_method)
         self.measurement_hud.apply_alignment_requested.connect(self.apply_disk_alignment)
         self.measurement_hud.reset_disk_requested.connect(self.reset_disk_alignment)
+        self.measurement_hud.calibrate_ruler_requested.connect(self.open_crater_calibration_dialog)
+        self.measurement_hud.reset_ruler_scale_requested.connect(self.reset_scale_calibration)
 
         self.welcome_widget = ZeroStateWidget(self.viewport())
         self.welcome_widget.fileSelected.connect(self.fileDropped.emit)
@@ -1283,6 +1287,20 @@ class AstroCanvas(QGraphicsView):
         self._update_interaction_state()
 
     @property
+    def scale_km_per_px(self) -> float:
+        """Масштаб съемки в км/пиксель. При наличии пользовательской калибровки возвращает её."""
+        if getattr(self, '_custom_scale_km_per_px', None) is not None and self._custom_scale_km_per_px > 0:
+            return self._custom_scale_km_per_px
+        lunar_dist = getattr(self, '_lunar_distance_km', 384400.0)
+        focal_len = max(1.0, getattr(self, '_telescope_focal_len', 1000.0))
+        pixel_size = max(0.1, getattr(self, '_telescope_pixel_size', 3.76))
+        return (pixel_size / (focal_len * 1000.0)) * lunar_dist
+
+    @scale_km_per_px.setter
+    def scale_km_per_px(self, val: Optional[float]):
+        self._custom_scale_km_per_px = float(val) if (val is not None and val > 0) else None
+
+    @property
     def zoom_factor(self) -> float:
         """Текущий коэффициент зума отображения кадра."""
         return max(1e-4, float(self.transform().m11()))
@@ -1592,7 +1610,8 @@ class AstroCanvas(QGraphicsView):
             x0, y0, r_disk = self.calibrated_disk
             if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
                 self.measurement_hud.set_disk_status(True, r_disk)
-            self.set_status_text(f"Диск Луны откалиброван: R={int(round(r_disk))} px. Режим: Линейка.")
+            dia_km = 2.0 * r_disk * self.scale_km_per_px
+            self.set_status_text(f"Диск Луны откалиброван: R={int(round(r_disk))} px (D={dia_km:.1f} км). Режим: Линейка.")
             self.temp_disk_rect = None
             self.pending_disk = None
             self.disk_is_dragging = False
@@ -1663,6 +1682,42 @@ class AstroCanvas(QGraphicsView):
             self._emit_ruler_info()
         self.viewport().update()
 
+    def open_crater_calibration_dialog(self):
+        """Открывает диалог калибровки масштаба линейки по выбранному кратеру."""
+        if self._ruler_p1 is None or self._ruler_p2 is None:
+            return
+        dx = self._ruler_p2.x() - self._ruler_p1.x()
+        dy = self._ruler_p2.y() - self._ruler_p1.y()
+        dist_px = float(np.hypot(dx, dy))
+        if dist_px <= 0.1:
+            return
+        dlg = CraterCalibrationDialog(dist_px, parent=self.window(), lunar_distance_km=self._lunar_distance_km)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.scale_km_per_px = dlg.scale_km_per_px
+            if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+                self.measurement_hud.set_scale_calibrated(True, dlg.scale_km_per_px)
+            self._emit_ruler_info()
+            if hasattr(self, 'status_overlay') and self.status_overlay is not None:
+                if hasattr(self.status_overlay, 'show_message'):
+                    self.status_overlay.show_message(f"Scale: {dlg.scale_km_per_px:.4f} km/px ({dlg.crater_name})")
+                elif hasattr(self.status_overlay, 'setText'):
+                    self.status_overlay.setText(f"Scale: {dlg.scale_km_per_px:.4f} km/px ({dlg.crater_name})")
+                    self._update_overlay_pos()
+            self.viewport().update()
+
+    def reset_scale_calibration(self):
+        """Сбрасывает калибровку масштаба к расчету из фокусного расстояния и размера пикселя."""
+        self.scale_km_per_px = None
+        if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
+            self.measurement_hud.set_scale_calibrated(False)
+        if self._ruler_p1 is not None and self._ruler_p2 is not None:
+            self._emit_ruler_info()
+        if self.ellipse_start is not None and self.ellipse_end is not None:
+            cur = self._ellipse_cursor or self.ellipse_end
+            self._update_ellipse_calc(cur)
+        self.set_status_text("Калибровка масштаба сброшена к оптике по умолчанию")
+        self.viewport().update()
+
     def clear_ruler(self):
         self._ruler_p1 = None
         self._ruler_p2 = None
@@ -1698,8 +1753,7 @@ class AstroCanvas(QGraphicsView):
             ang_str = f"{ang_arcsec / 3600.0:.2f}°"
 
         lunar_dist = getattr(self, '_lunar_distance_km', 384400.0)
-        # Distance_km = (Pixels * (Pixel_Size_um / (Focal_Length_mm * 1000))) * Current_Moon_Distance_km
-        km = (dist_px * (self._telescope_pixel_size / (self._telescope_focal_len * 1000.0))) * lunar_dist
+        km = dist_px * self.scale_km_per_px
 
         unit = getattr(self, '_ruler_unit', 'all')
         if unit == 'px':
@@ -1727,8 +1781,11 @@ class AstroCanvas(QGraphicsView):
         dist_str, ang_str = self._format_ruler_dist(dist_px)
 
         lunar_dist = getattr(self, '_lunar_distance_km', 384400.0)
-        scale_km_per_px = (self._telescope_pixel_size / (self._telescope_focal_len * 1000.0)) * lunar_dist
+        scale_km_per_px = self.scale_km_per_px
         proj_km = dist_px * scale_km_per_px
+        arcsec_per_px = (scale_km_per_px / lunar_dist) * (180.0 * 3600.0 / math.pi)
+        length_arcsec = dist_px * arcsec_per_px
+        hud_text = f"{dist_px:.1f} px | {proj_km:.2f} km | {length_arcsec:.2f}\""
 
         true_km = None
         tilt_deg = 0.0
@@ -1752,13 +1809,13 @@ class AstroCanvas(QGraphicsView):
                 summary = f"Proj: {dist_str} | True: N/A (Limb boundary) | {angle_deg:.1f}°"
             if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
                 self.measurement_hud.set_ruler_results(
-                    proj_km, ang_str, dist_px, true_km, tilt_deg, cos_theta, is_calibrated=True
+                    proj_km, ang_str, dist_px, true_km, tilt_deg, cos_theta, is_calibrated=True, ruler_text=hud_text
                 )
         else:
             summary = f"L: {dist_str} | Angle: {angle_deg:.1f}°"
             if hasattr(self, 'measurement_hud') and self.measurement_hud is not None:
                 self.measurement_hud.set_ruler_results(
-                    proj_km, ang_str, dist_px, is_calibrated=False
+                    proj_km, ang_str, dist_px, is_calibrated=False, ruler_text=hud_text
                 )
 
         self.rulerMeasured.emit(dist_px, angle_deg, summary)
@@ -1778,8 +1835,7 @@ class AstroCanvas(QGraphicsView):
         p1 = (p_start.x(), p_start.y())
         p2 = (p_end.x(), p_end.y())
         p_cur = (cursor_pos.x(), cursor_pos.y())
-        lunar_dist = getattr(self, '_lunar_distance_km', 384400.0)
-        scale_km_per_px = (self._telescope_pixel_size / (self._telescope_focal_len * 1000.0)) * lunar_dist
+        scale_km_per_px = self.scale_km_per_px
         try:
             self._ellipse_data = calculate_crater_ellipse(
                 p1, p2, p_cur, scale_km_per_px
@@ -1856,11 +1912,12 @@ class AstroCanvas(QGraphicsView):
                 pad_x, pad_y = 8, 3
                 bg_rect = QRectF(x, y, text_w + pad_x * 2, text_h + pad_y * 2)
 
-                border_col = accent_col if is_after else QColor("#555566")
+                border_col = accent_col if is_after else QColor(229, 169, 59, 140)
                 painter.setPen(QPen(border_col, 1))
-                painter.setBrush(QBrush(QColor(18, 18, 24, 230)))
-                painter.drawRoundedRect(bg_rect, 5, 5)
+                painter.setBrush(QBrush(QColor(20, 24, 34, 160)))
+                painter.drawRoundedRect(bg_rect, 3, 3)
 
+                painter.setBackgroundMode(Qt.BGMode.TransparentMode)
                 text_col = accent_col if is_after else QColor("#d0d0dc")
                 painter.setPen(text_col)
                 painter.drawText(bg_rect, Qt.AlignmentFlag.AlignCenter, text)
@@ -2008,6 +2065,7 @@ class AstroCanvas(QGraphicsView):
                     s_pt = self.image_to_screen(pt)
                     painter.setBrush(QBrush(QColor("#00adb5")))
                     painter.drawEllipse(s_pt, 5.0, 5.0)
+                    painter.setBackgroundMode(Qt.BGMode.TransparentMode)
                     painter.setPen(QColor("#ffffff"))
                     painter.drawText(QRectF(s_pt.x() + 7.0, s_pt.y() - 10.0, 30.0, 18.0), Qt.AlignmentFlag.AlignLeft, f"P{i+1}")
                     painter.setPen(pt_pen)
@@ -2045,10 +2103,10 @@ class AstroCanvas(QGraphicsView):
             try:
                 painter.save()
                 view_scale = max(1e-4, self.transform().m11())
-                p1_vp = self.mapFromScene(p_start)
+                p1_vp = QPointF(self.mapFromScene(p_start))
 
                 if stage == 1 and p_end is not None:
-                    p2_vp = self.mapFromScene(p_end)
+                    p2_vp = QPointF(self.mapFromScene(p_end))
                     if not (math.isnan(p1_vp.x()) or math.isnan(p1_vp.y()) or math.isnan(p2_vp.x()) or math.isnan(p2_vp.y())):
                         axis_pen = QPen(QColor("#00e5ff"), 1.8)
                         axis_pen.setCosmetic(True)
@@ -2120,9 +2178,10 @@ class AstroCanvas(QGraphicsView):
                             badge_y = max(10.0, min(badge_y, float(vp_h) - bh - 10.0))
                             b_rect = QRectF(badge_x, badge_y, bw, bh)
 
-                            painter.setPen(QPen(QColor("#00e5ff"), 1))
-                            painter.setBrush(QBrush(QColor(18, 18, 26, 230)))
-                            painter.drawRoundedRect(b_rect, 5, 5)
+                            painter.setPen(QPen(QColor(229, 169, 59, 140), 1))
+                            painter.setBrush(QBrush(QColor(20, 24, 34, 160)))
+                            painter.drawRoundedRect(b_rect, 3, 3)
+                            painter.setBackgroundMode(Qt.BGMode.TransparentMode)
                             painter.setPen(QColor("#e2e8f0"))
                             painter.drawText(b_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
 
@@ -2168,8 +2227,7 @@ class AstroCanvas(QGraphicsView):
 
             if self._calibrated_disk is not None:
                 x0, y0, r_disk = self._calibrated_disk
-                lunar_dist = getattr(self, '_lunar_distance_km', 384400.0)
-                scale_km_per_px = (self._telescope_pixel_size / (self._telescope_focal_len * 1000.0)) * lunar_dist
+                scale_km_per_px = self.scale_km_per_px
                 corr = calculate_spherical_correction(
                     (self._ruler_p1.x(), self._ruler_p1.y()),
                     (self._ruler_p2.x(), self._ruler_p2.y()),
@@ -2205,10 +2263,11 @@ class AstroCanvas(QGraphicsView):
             by = max(10.0, min(by, float(vp_h) - bh - 10.0))
             b_rect = QRectF(bx, by, bw, bh)
 
-            painter.setPen(QPen(QColor("#e5a93b"), 1))
-            painter.setBrush(QBrush(QColor(18, 18, 26, 225)))
-            painter.drawRoundedRect(b_rect, 5, 5)
+            painter.setPen(QPen(QColor(229, 169, 59, 140), 1))
+            painter.setBrush(QBrush(QColor(20, 24, 34, 160)))
+            painter.drawRoundedRect(b_rect, 3, 3)
 
+            painter.setBackgroundMode(Qt.BGMode.TransparentMode)
             painter.setPen(QColor("#ffe8a0"))
             painter.drawText(b_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
 

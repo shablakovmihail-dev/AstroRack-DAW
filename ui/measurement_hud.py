@@ -124,6 +124,8 @@ class MeasurementBottomBar(QFrame):
     apply_alignment_requested = pyqtSignal()
     reset_disk_requested = pyqtSignal()
     close_requested = pyqtSignal()
+    calibrate_ruler_requested = pyqtSignal()
+    reset_ruler_scale_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -138,6 +140,8 @@ class MeasurementBottomBar(QFrame):
         self._is_calibrated = False
         self._calibrated_radius = 0.0
         self._pending_active = False
+        self._is_scale_calibrated = False
+        self._scale_km_per_px = 0.0
         self._last_proj_km = 0.0
         self._last_true_km = None
         self._last_tilt_deg = 0.0
@@ -462,6 +466,77 @@ class MeasurementBottomBar(QFrame):
         step_layout.addWidget(self.lbl_ellipse_step)
         ctx_layout.addWidget(self.ellipse_step_box)
 
+        # 2.D Блок калибровки и отображения линейки: [ Текст замера ] [ Калибровать ] [ ✕ ]
+        self.ruler_scale_box = QFrame()
+        self.ruler_scale_box.setObjectName("rulerScaleBox")
+        self.ruler_scale_box.setStyleSheet("""
+            QFrame#rulerScaleBox {
+                background-color: #161920;
+                border: 1px solid #2a3441;
+                border-radius: 6px;
+                padding: 2px 6px;
+            }
+        """)
+        ruler_box_layout = QHBoxLayout(self.ruler_scale_box)
+        ruler_box_layout.setContentsMargins(6, 2, 6, 2)
+        ruler_box_layout.setSpacing(6)
+
+        self.lbl_ruler_scale = QLabel("Линейка: протяните отрезок (M)")
+        self.lbl_ruler_scale.setStyleSheet("color: #e5a93b; font-size: 11px; font-weight: bold; background: transparent; border: none; padding: 0 4px;")
+        ruler_box_layout.addWidget(self.lbl_ruler_scale)
+
+        self.btn_calibrate_ruler = QPushButton("Калибровать")
+        self.btn_calibrate_ruler.setFixedHeight(22)
+        self.btn_calibrate_ruler.setEnabled(False)
+        self.btn_calibrate_ruler.setToolTip("Откалибровать масштаб линейки по известному диаметру кратера")
+        self.btn_calibrate_ruler.setStyleSheet("""
+            QPushButton {
+                background-color: #1e2436;
+                color: #00e5ff;
+                border: 1px solid #2a3441;
+                border-radius: 4px;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 1px 8px;
+            }
+            QPushButton:hover:enabled {
+                background-color: #00adb5;
+                color: #111114;
+                border-color: #00fff2;
+            }
+            QPushButton:disabled {
+                color: #555e75;
+                background-color: #161822;
+                border-color: #202430;
+            }
+        """)
+        self.btn_calibrate_ruler.clicked.connect(self.calibrate_ruler_requested.emit)
+        ruler_box_layout.addWidget(self.btn_calibrate_ruler)
+
+        self.btn_reset_ruler_scale = QPushButton("✕")
+        self.btn_reset_ruler_scale.setFixedSize(22, 22)
+        self.btn_reset_ruler_scale.setVisible(False)
+        self.btn_reset_ruler_scale.setToolTip("Сбросить калибровку масштаба к значениям оптики по умолчанию")
+        self.btn_reset_ruler_scale.setStyleSheet("""
+            QPushButton {
+                background-color: #242938;
+                color: #cbd5e1;
+                border: 1px solid #384259;
+                border-radius: 4px;
+                font-size: 10px;
+                padding: 0;
+            }
+            QPushButton:hover:enabled {
+                background-color: #dc2626;
+                color: #ffffff;
+                border-color: #ef4444;
+            }
+        """)
+        self.btn_reset_ruler_scale.clicked.connect(self.reset_ruler_scale_requested.emit)
+        ruler_box_layout.addWidget(self.btn_reset_ruler_scale)
+
+        ctx_layout.addWidget(self.ruler_scale_box)
+
         bar_layout.addWidget(self.context_container)
 
         # Скрытая метка подсказки (для обратной совместимости вызовов)
@@ -664,6 +739,9 @@ class MeasurementBottomBar(QFrame):
     def _update_contextual_visibility(self):
         self._update_disk_buttons()
         self.ellipse_step_box.setVisible(self._current_mode == "ellipse")
+        self.ruler_scale_box.setVisible(self._current_mode == "ruler")
+        if self._current_mode == "ruler":
+            self.btn_reset_ruler_scale.setVisible(self._is_scale_calibrated)
 
     def set_mode(self, mode: str):
         self._current_mode = mode
@@ -674,6 +752,11 @@ class MeasurementBottomBar(QFrame):
         elif mode == "ellipse":
             self.btn_mode_ellipse.setChecked(True)
         self._update_contextual_visibility()
+
+    def set_scale_calibrated(self, calibrated: bool, scale_km_per_px: float = 0.0):
+        self._is_scale_calibrated = calibrated
+        self._scale_km_per_px = scale_km_per_px
+        self.btn_reset_ruler_scale.setVisible(calibrated and self._current_mode == "ruler")
 
     def set_disk_status(self, calibrated: bool, radius_px: float = 0.0):
         self._is_calibrated = calibrated
@@ -711,7 +794,8 @@ class MeasurementBottomBar(QFrame):
         true_km: Optional[float] = None,
         tilt_deg: float = 0.0,
         cos_theta: float = 1.0,
-        is_calibrated: bool = False
+        is_calibrated: bool = False,
+        ruler_text: Optional[str] = None
     ):
         self._last_proj_km = projected_km
         self._last_true_km = true_km
@@ -724,6 +808,15 @@ class MeasurementBottomBar(QFrame):
         else:
             self.row_res_2.setText("True: —")
             self.row_res_3.setText("Tilt: —")
+
+        if ruler_text:
+            self.lbl_ruler_scale.setText(ruler_text)
+        elif dist_px > 0:
+            self.lbl_ruler_scale.setText(f"{dist_px:.1f} px | {projected_km:.2f} km | {ang_str}")
+        else:
+            self.lbl_ruler_scale.setText("Линейка: протяните отрезок (M)")
+        self.btn_calibrate_ruler.setEnabled(dist_px > 0)
+        self.btn_reset_ruler_scale.setVisible(self._is_scale_calibrated and self._current_mode == "ruler")
 
     def set_ellipse_results(
         self,
@@ -743,6 +836,8 @@ class MeasurementBottomBar(QFrame):
         self.row_res_1.setText("Proj: —")
         self.row_res_2.setText("True: —")
         self.row_res_3.setText("Tilt: —")
+        self.lbl_ruler_scale.setText("Линейка: протяните отрезок (M)")
+        self.btn_calibrate_ruler.setEnabled(False)
 
 
 # Псевдоним для полной обратной совместимости
