@@ -4,6 +4,7 @@ import time
 import math
 import logging
 import traceback
+from typing import Optional, Tuple
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF, QTimer, QPoint, QRect
@@ -475,10 +476,25 @@ class SplitImageGraphicsItem(QGraphicsItem):
         super().__init__()
         self.raw_pixmap = QPixmap()
         self.processed_pixmap = QPixmap()
+        self.roi_pixmap = None
+        self.roi_rect = None  # (x, y, w, h)
         self.split_active = False
         self.split_fraction = 0.5
         self.split_orientation = "Vertical"
         self.split_inverted = False
+
+    def set_roi_patch(self, pixmap: QPixmap, roi_rect: tuple[int, int, int, int]):
+        if pixmap is None or pixmap.isNull() or roi_rect is None:
+            return
+        self.roi_rect = roi_rect
+        self.roi_pixmap = pixmap
+        self.update()
+
+    def clear_roi_patch(self):
+        if self.roi_pixmap is not None or self.roi_rect is not None:
+            self.roi_pixmap = None
+            self.roi_rect = None
+            self.update()
 
     def boundingRect(self) -> QRectF:
         w = max(self.raw_pixmap.width(), self.processed_pixmap.width())
@@ -496,8 +512,19 @@ class SplitImageGraphicsItem(QGraphicsItem):
         if w <= 0 or h <= 0:
             return
 
+        # Атомарный локальный снимок RoI-патча на время выполнения paint
+        cur_roi_pix = self.roi_pixmap
+        cur_roi_rect = self.roi_rect
+        has_roi = (
+            cur_roi_pix is not None
+            and not cur_roi_pix.isNull()
+            and cur_roi_rect is not None
+        )
+
         if not self.split_active or self.raw_pixmap.isNull():
             painter.drawPixmap(0, 0, self.processed_pixmap)
+            if has_roi:
+                painter.drawPixmap(cur_roi_rect[0], cur_roi_rect[1], cur_roi_pix)
             return
 
         # Защита от рассинхронизации размеров raw и processed при смене изображения
@@ -512,6 +539,8 @@ class SplitImageGraphicsItem(QGraphicsItem):
         painter.save()
         # 1. Отрисовка полного изображения Before с текущими параметрами зума (zoom_factor) и смещения (pan_offset)
         painter.drawPixmap(0, 0, pix_first)
+        if has_roi and self.split_inverted:
+            painter.drawPixmap(cur_roi_rect[0], cur_roi_rect[1], cur_roi_pix)
 
         # 2. Определение области отсечения (clipping rect) для слоя After по координате сплиттера в координатах виджета
         orig_transform = painter.transform()
@@ -535,6 +564,8 @@ class SplitImageGraphicsItem(QGraphicsItem):
         # 3. Поверх отрисовываем полное изображение After с абсолютно теми же трансформациями zoom_factor и pan_offset
         painter.setTransform(orig_transform)
         painter.drawPixmap(0, 0, pix_second)
+        if has_roi and not self.split_inverted:
+            painter.drawPixmap(cur_roi_rect[0], cur_roi_rect[1], cur_roi_pix)
         painter.restore()
 
         painter.restore()
@@ -663,6 +694,9 @@ class AstroCanvas(QGraphicsView):
         self._raw_qimg = None
         self._proc_u8_buf = None
         self._proc_qimg = None
+        self._roi_u8_buf = None
+        self._roi_pool_buf = None
+        self._roi_qimg = None
         self._last_scene_size = (0, 0)
 
         self._zoom_timer = QTimer(self)
@@ -719,7 +753,7 @@ class AstroCanvas(QGraphicsView):
             dst_buf = np.empty(src.shape, dtype=np.uint8, order='C')
 
         # SIMD-конвертация с насыщением [0..255] без промежуточных float-массивов
-        cv2.addWeighted(src, 255.0, src, 0.0, 0.0, dst=dst_buf, dtype=cv2.CV_8U)
+        cv2.convertScaleAbs(src, dst=dst_buf, alpha=255.0)
         return dst_buf
 
     @staticmethod
@@ -930,6 +964,9 @@ class AstroCanvas(QGraphicsView):
         self._raw_qimg = None
         self._proc_u8_buf = None
         self._proc_qimg = None
+        self._roi_u8_buf = None
+        self._roi_pool_buf = None
+        self._roi_qimg = None
         self._last_scene_size = (0, 0)
         self._item.raw_pixmap = QPixmap()
         self._item.processed_pixmap = QPixmap()
@@ -949,6 +986,7 @@ class AstroCanvas(QGraphicsView):
         # Синхронизируем processed_pixmap, чтобы исключить рассинхронизацию размеров
         if self._item.processed_pixmap.isNull() or self._item.processed_pixmap.size() != self._item.raw_pixmap.size():
             self._item.processed_pixmap = self._item.raw_pixmap.copy()
+        self._item.clear_roi_patch()
         self._sync_scene_bounds_if_changed()
         self.fit_current_image()
         if hasattr(self, 'welcome_widget'):
@@ -967,9 +1005,11 @@ class AstroCanvas(QGraphicsView):
         is_first = self._item.processed_pixmap.isNull()
         self._proc_u8_buf = self._convert_float_to_u8_inplace(img_float, self._proc_u8_buf)
         self._proc_qimg = self._wrap_u8_as_qimage(self._proc_u8_buf)
-        self._item.processed_pixmap = QPixmap.fromImage(
+        new_pixmap = QPixmap.fromImage(
             self._proc_qimg, Qt.ImageConversionFlag.NoFormatConversion
         )
+        self._item.processed_pixmap = new_pixmap
+        self._item.clear_roi_patch()
         self._sync_scene_bounds_if_changed()
         if is_first:
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -979,6 +1019,71 @@ class AstroCanvas(QGraphicsView):
         if getattr(self, 'clipping_overlay_mode', None) is not None:
             self.set_clipping_overlay_mode(self.clipping_overlay_mode)
         self.viewport().update()
+
+    def set_processed_roi(self, roi_float: np.ndarray, roi_rect: tuple[int, int, int, int]):
+        """Накладывает обработанный RoI-патч во время интерактивного превью."""
+        if roi_float is None or roi_float.size == 0 or roi_rect is None:
+            return
+        # Пул памяти RoI: исключаем повторные аллокации памяти при каждом сдвиге мыши
+        needed = roi_float.size
+        if self._roi_pool_buf is None or self._roi_pool_buf.size < needed:
+            # Выделяем с запасом 20%
+            alloc_size = max(needed, int(needed * 1.2))
+            self._roi_pool_buf = np.empty(alloc_size, dtype=np.uint8)
+
+        # Срез одномерного пула гарантированно C-contiguous
+        u8_view = self._roi_pool_buf[:needed].reshape(roi_float.shape)
+        cv2.convertScaleAbs(roi_float, dst=u8_view, alpha=255.0)
+        self._roi_u8_buf = u8_view
+
+        raw_qimg = self._wrap_u8_as_qimage(self._roi_u8_buf)
+        if raw_qimg.isNull():
+            return
+        # Глубокая копия памяти ядра Qt гарантирует отсутствие висячих указателей
+        self._roi_qimg = raw_qimg.copy()
+        pix = QPixmap.fromImage(self._roi_qimg, Qt.ImageConversionFlag.NoFormatConversion)
+        if pix.isNull():
+            return
+        self._item.set_roi_patch(pix, roi_rect)
+        self.viewport().update()
+
+    def get_visible_image_roi(self, padding: int = 64) -> Optional[tuple[int, int, int, int]]:
+        """Вычисляет видимый прямоугольник кадра через mapToScene.
+
+        Если в окно умещается всё изображение целиком (Fit-to-Screen), возвращает None.
+        Иначе возвращает (x0, y0, w, h) с учетом безопасного сплайн-отступа padding.
+        """
+        if self._item.boundingRect().isEmpty():
+            return None
+
+        vp_rect = self.viewport().rect()
+        scene_poly = self.mapToScene(vp_rect)
+        visible_rect = scene_poly.boundingRect()
+
+        img_w = int(round(self._item.boundingRect().width()))
+        img_h = int(round(self._item.boundingRect().height()))
+        if img_w <= 0 or img_h <= 0:
+            return None
+
+        img_rect = QRectF(0.0, 0.0, float(img_w), float(img_h))
+        intersected = visible_rect.intersected(img_rect)
+        if intersected.isEmpty():
+            return None
+
+        # Если видимая зона охватывает 98% или более кадра — это Fit-to-Screen (полный кадр)
+        if intersected.width() >= img_w * 0.98 and intersected.height() >= img_h * 0.98:
+            return None
+
+        x0 = max(0, int(np.floor(intersected.left())) - padding)
+        y0 = max(0, int(np.floor(intersected.top())) - padding)
+        x1 = min(img_w, int(np.ceil(intersected.right())) + padding)
+        y1 = min(img_h, int(np.ceil(intersected.bottom())) + padding)
+
+        w = x1 - x0
+        h = y1 - y0
+        if w <= 0 or h <= 0:
+            return None
+        return (x0, y0, w, h)
 
     def show_welcome_state(self):
         """Переводит холст в интерактивный режим ожидания (Zero State)."""

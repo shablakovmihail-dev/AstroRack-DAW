@@ -1,4 +1,5 @@
 #"""Главное окно приложения AstroRackWindow с DAW-тулбаром и конвейером обработки."""
+from collections import OrderedDict
 import os
 import time
 import json
@@ -99,6 +100,11 @@ class AstroRackWindow(QMainWindow):
         self._last_dispatched_params = None
         self._render_start_time = 0.0
 
+        # Кэш готовых состояний (State Frame Cache) для мгновенного переключения (0-5 мс)
+        self._state_frame_cache = OrderedDict()
+        self._MAX_STATE_CACHE = 6
+        self._is_applying_state = False
+
         # Троттлинг/дебаунс превью-рендера при движении ползунков (~35 мс)
         self._debounce_timer = QTimer(self)
         self._debounce_timer.setSingleShot(True)
@@ -109,7 +115,7 @@ class AstroRackWindow(QMainWindow):
         self._final_render_timer = QTimer(self)
         self._final_render_timer.setSingleShot(True)
         self._final_render_timer.setInterval(110)
-        self._final_render_timer.timeout.connect(lambda: self._execute_render(preview=False))
+        self._final_render_timer.timeout.connect(self._on_final_render_timeout)
 
         # Троттлинг обновления гистограммы, чтобы не задерживать отрисовку холста
         self._hist_timer = QTimer(self)
@@ -174,12 +180,14 @@ class AstroRackWindow(QMainWindow):
         self.worker = PipelineWorker()
         self.worker.moveToThread(self.thread)
         self.worker.frame_ready.connect(self._on_frame_rendered)
+        self.worker.roi_frame_ready.connect(self._on_roi_frame_rendered)
         self.worker.rgb_shifts_computed.connect(self._on_rgb_shifts_computed)
         self.thread.start()
 
         self._panel_collapsed = False
         self.last_expanded_width = 350
         self._last_panel_width = 350
+        self._roi_busy = False
 
         self._setup_ui()
         self._apply_dark_theme()
@@ -1940,6 +1948,7 @@ class AstroRackWindow(QMainWindow):
 
         self._reset_active_tools()
         self._last_dispatched_params = None
+        self._clear_state_frame_cache()
         self.canvas.set_raw_image(self._raw_image)
         self.canvas.fit_current_image()
         self.worker.set_source_image(self._raw_image)
@@ -1955,7 +1964,9 @@ class AstroRackWindow(QMainWindow):
 
         self._raw_image = transform_fn(self._raw_image)
         self._last_dispatched_params = None
+        self._clear_state_frame_cache()
         self.canvas.set_raw_image(self._raw_image)
+        self._clear_state_frame_cache()
         self.worker.set_source_image(self._raw_image)
 
         if self._current_processed_image is not None:
@@ -2122,6 +2133,7 @@ class AstroRackWindow(QMainWindow):
         self._current_filename = os.path.basename(file_path)
 
         self.canvas.set_raw_image(self._raw_image)
+        self._clear_state_frame_cache()
         self.worker.set_source_image(self._raw_image)
         self.lbl_status.setText(f"{self._current_filename} [{img.shape[1]}x{img.shape[0]}]")
         self._update_status_image_specs()
@@ -2214,6 +2226,8 @@ class AstroRackWindow(QMainWindow):
 
     def update_insert_param(self, insert_id: int, param_name: str, value: float):
         """Прямое обновление параметра инсерта в пайплайне и запуск рендера."""
+        if getattr(self, '_is_applying_state', False):
+            return
         insert_map = {
             1: ('w_wet_mix', self.insert1_wavelet),
             2: ('rl_wet_mix', self.insert2_rl),
@@ -2232,15 +2246,29 @@ class AstroRackWindow(QMainWindow):
 
     def schedule_render(self):
         # Троттлинг (не более ~28 кадров/с во время ведения ползунка) + отложенный чистовой рендер
+        if getattr(self, '_is_applying_state', False):
+            return
         if not self._debounce_timer.isActive():
             self._debounce_timer.start()
         self._final_render_timer.start()
 
     def _on_debounce_timeout(self):
-        is_dragging = self._is_dragging_slider()
-        self._execute_render(preview=is_dragging)
+        self._execute_render(preview=True)
+
+    def _on_final_render_timeout(self):
+        # Пока зажата ЛКМ (активный drag) — чистовой Full-Res откладываем
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            self._final_render_timer.start(100)
+            return
+        self._execute_render(preview=False)
 
     def _on_parameter_committed(self):
+        # Если событие commit пришло при зажатой мыши, чистовой рендер запустится по отпусканию
+        if getattr(self, '_is_applying_state', False):
+            return
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            self._final_render_timer.start(100)
+            return
         self._debounce_timer.stop()
         self._final_render_timer.stop()
         self._execute_render(preview=False)
@@ -2248,6 +2276,8 @@ class AstroRackWindow(QMainWindow):
 
     def _on_wavelet_layers_changed(self, action_name: str):
         """Добавление/удаление слоя вейвлета: немедленный рендер и отдельная запись в Undo/Redo."""
+        if getattr(self, '_is_applying_state', False):
+            return
         self._debounce_timer.stop()
         self._final_render_timer.stop()
         self._execute_render(preview=False)
@@ -2258,7 +2288,29 @@ class AstroRackWindow(QMainWindow):
         self._final_render_timer.stop()
         self._execute_render(preview=False)
 
+    def _make_state_cache_key(self, params: dict) -> Optional[str]:
+        if not params:
+            return None
+        # Исключаем временные ключи превью и RoI
+        clean = {k: v for k, v in params.items() if not k.startswith('_')}
+        try:
+            return json.dumps(clean, sort_keys=True)
+        except Exception:
+            return None
+
+    def _clear_state_frame_cache(self):
+        self._state_frame_cache.clear()
+
     def _execute_render(self, preview: bool = False):
+        # Железный барьер: во время удержания мыши (drag) разрешён ТОЛЬКО preview=True
+        if not preview and (QApplication.mouseButtons() & Qt.MouseButton.LeftButton):
+            preview = True
+            self._final_render_timer.start(100)
+
+        roi_rect = None
+        if preview and hasattr(self, 'canvas') and self.canvas is not None:
+            roi_rect = self.canvas.get_visible_image_roi(padding=64)
+
         params = {
             'global_bypass': self.btn_global_bypass.isChecked(),
             'master_limiter_enabled': getattr(self, 'btn_master_limiter', None) is not None and self.btn_master_limiter.isChecked(),
@@ -2271,6 +2323,7 @@ class AstroRackWindow(QMainWindow):
             'insert5_enabled': self.insert5_lc.is_enabled(),
             'insert6_enabled': self.insert6_color.is_enabled(),
             '_preview': bool(preview),
+            '_roi_rect': roi_rect,
         }
         params.update(self.insert1_wavelet.get_values())
         params.update(self.insert2_rl.get_values())
@@ -2279,14 +2332,44 @@ class AstroRackWindow(QMainWindow):
         params.update(self.insert5_lc.get_values())
         params.update(self.insert6_color.get_values())
 
+        if not preview:
+            cache_key = self._make_state_cache_key(params)
+            if cache_key and cache_key in self._state_frame_cache:
+                cached_frame = self._state_frame_cache[cache_key]
+                self._state_frame_cache.move_to_end(cache_key)
+                self.worker.cancel_current()
+                self._current_processed_image = cached_frame
+                self.canvas.set_processed_image(cached_frame)
+                self._last_dispatched_params = params.copy()
+                if hasattr(self, 'lbl_sb_pipeline'):
+                    self.lbl_sb_pipeline.setText("State Cache (Instant: 0 ms)")
+                if not self._hist_timer.isActive():
+                    self._hist_timer.start()
+                return
+
         if self._last_dispatched_params == params:
             return
         self._last_dispatched_params = params.copy()
         self._render_start_time = time.perf_counter()
         if hasattr(self, 'lbl_sb_pipeline'):
-            self.lbl_sb_pipeline.setText("Processing...")
-            self.lbl_sb_pipeline.setStyleSheet("color: #f59e0b; font-weight: bold;")
+            self.lbl_sb_pipeline.setText("Processing..." if roi_rect is None else "Processing RoI...")
         self.worker.request_processing(params)
+
+    def _on_roi_frame_rendered(self, roi_frame: np.ndarray, roi_rect: tuple):
+        if roi_frame is None or roi_frame.size == 0 or roi_rect is None:
+            return
+        # Защита от переполнения очереди Qt: пропускаем кадр, если предыдущий ещё отрисовывается
+        if getattr(self, '_roi_busy', False):
+            return
+
+        self._roi_busy = True
+        try:
+            render_ms = (time.perf_counter() - getattr(self, '_render_start_time', time.perf_counter())) * 1000.0
+            if hasattr(self, 'lbl_sb_pipeline'):
+                self.lbl_sb_pipeline.setText(f"Preview (RoI): {render_ms:.0f} ms")
+            self.canvas.set_processed_roi(roi_frame, roi_rect)
+        finally:
+            self._roi_busy = False
 
     def _on_frame_rendered(self, processed_frame: np.ndarray):
         if processed_frame is None or processed_frame.size == 0:
@@ -2298,8 +2381,17 @@ class AstroRackWindow(QMainWindow):
         render_ms = (time.perf_counter() - getattr(self, '_render_start_time', time.perf_counter())) * 1000.0
         if hasattr(self, 'lbl_sb_pipeline'):
             self.lbl_sb_pipeline.setText(f"Render: {render_ms:.0f} ms")
-            self.lbl_sb_pipeline.setStyleSheet("color: #00adb5; font-weight: bold;")
         self._current_processed_image = processed_frame
+
+        # Сохраняем в LRU-кэш готовых состояний
+        if getattr(self, '_last_dispatched_params', None) and not self._last_dispatched_params.get('_preview', False):
+            cache_key = self._make_state_cache_key(self._last_dispatched_params)
+            if cache_key:
+                self._state_frame_cache[cache_key] = processed_frame
+                self._state_frame_cache.move_to_end(cache_key)
+                while len(self._state_frame_cache) > self._MAX_STATE_CACHE:
+                    self._state_frame_cache.popitem(last=False)
+
         self.canvas.set_processed_image(processed_frame)
         if not self._hist_timer.isActive():
             self._hist_timer.start()
@@ -2371,71 +2463,76 @@ class AstroRackWindow(QMainWindow):
         self._record_current_state("Master Limiter")
 
     def _apply_preset_dict(self, p: dict):
-        if 'raw_image' in p and p['raw_image'] is not None:
-            if self._raw_image is None or self._raw_image is not p['raw_image']:
-                self._raw_image = p['raw_image'].copy()
-                self._last_dispatched_params = None
-                self.canvas.set_raw_image(self._raw_image)
-                self.worker.set_source_image(self._raw_image)
-                self.lbl_status.setText(f"{self._current_filename} [{self._raw_image.shape[1]}x{self._raw_image.shape[0]}]")
-                self._update_status_image_specs()
-                self._update_canvas_guard_state()
+        self._is_applying_state = True
+        try:
+            if 'raw_image' in p and p['raw_image'] is not None:
+                if self._raw_image is None or self._raw_image is not p['raw_image']:
+                    self._raw_image = p['raw_image'].copy()
+                    self._last_dispatched_params = None
+                    self._clear_state_frame_cache()
+                    self.canvas.set_raw_image(self._raw_image)
+                    self.worker.set_source_image(self._raw_image)
+                    self.lbl_status.setText(f"{self._current_filename} [{self._raw_image.shape[1]}x{self._raw_image.shape[0]}]")
+                    self._update_status_image_specs()
+                    self._update_canvas_guard_state()
 
-        if 'canvas_transform' in p:
-            self.canvas.setTransform(p['canvas_transform'])
+            if 'canvas_transform' in p:
+                self.canvas.setTransform(p['canvas_transform'])
 
-        inserts = [
-            self.insert1_wavelet, self.insert2_rl, self.insert3_tone,
-            self.insert4_mono, self.insert5_lc, self.insert6_color
-        ]
-        for ins in inserts:
-            ins.blockSignals(True)
+            inserts = [
+                self.insert1_wavelet, self.insert2_rl, self.insert3_tone,
+                self.insert4_mono, self.insert5_lc, self.insert6_color
+            ]
+            for ins in inserts:
+                ins.blockSignals(True)
 
-        self.insert1_wavelet.set_enabled(p.get('insert1_enabled', False))
-        self.insert1_wavelet.set_values(p)
+            self.insert1_wavelet.set_enabled(p.get('insert1_enabled', False))
+            self.insert1_wavelet.set_values(p)
 
-        self.insert2_rl.set_enabled(p.get('insert2_enabled', False))
-        self.insert2_rl.set_values(p)
+            self.insert2_rl.set_enabled(p.get('insert2_enabled', False))
+            self.insert2_rl.set_values(p)
 
-        self.insert3_tone.set_enabled(p.get('insert3_enabled', False))
-        self.insert3_tone.set_values(p)
+            self.insert3_tone.set_enabled(p.get('insert3_enabled', False))
+            self.insert3_tone.set_values(p)
 
-        self.insert4_mono.set_enabled(p.get('insert4_enabled', False))
-        self.insert4_mono.set_values(p)
+            self.insert4_mono.set_enabled(p.get('insert4_enabled', False))
+            self.insert4_mono.set_values(p)
 
-        self.insert5_lc.set_enabled(p.get('insert5_enabled', False))
-        self.insert5_lc.set_values(p)
+            self.insert5_lc.set_enabled(p.get('insert5_enabled', False))
+            self.insert5_lc.set_values(p)
 
-        self.insert6_color.set_enabled(p.get('insert6_enabled', False))
-        self.insert6_color.set_values(p)
+            self.insert6_color.set_enabled(p.get('insert6_enabled', False))
+            self.insert6_color.set_values(p)
 
-        for ins in inserts:
-            ins.blockSignals(False)
+            for ins in inserts:
+                ins.blockSignals(False)
 
-        self._sync_histogram_visors()
+            self._sync_histogram_visors()
 
-        is_limiter = bool(p.get('master_limiter_enabled', p.get('limiter_enabled', False)))
-        if hasattr(self, 'btn_master_limiter') and self.btn_master_limiter is not None:
-            self.btn_master_limiter.blockSignals(True)
-            self.btn_master_limiter.setChecked(is_limiter)
-            self.btn_master_limiter.blockSignals(False)
+            is_limiter = bool(p.get('master_limiter_enabled', p.get('limiter_enabled', False)))
+            if hasattr(self, 'btn_master_limiter') and self.btn_master_limiter is not None:
+                self.btn_master_limiter.blockSignals(True)
+                self.btn_master_limiter.setChecked(is_limiter)
+                self.btn_master_limiter.blockSignals(False)
 
-        is_bypass = p.get('global_bypass', False)
-        self.btn_global_bypass.blockSignals(True)
-        self.btn_global_bypass.setChecked(is_bypass)
-        self.btn_global_bypass.setText("MASTER BYPASS: ACTIVE (RAW VIEW)" if is_bypass else "MASTER BYPASS: INACTIVE (EFFECTS ON)")
-        self.btn_global_bypass.blockSignals(False)
+            is_bypass = p.get('global_bypass', False)
+            self.btn_global_bypass.blockSignals(True)
+            self.btn_global_bypass.setChecked(is_bypass)
+            self.btn_global_bypass.setText("MASTER BYPASS: ACTIVE (RAW VIEW)" if is_bypass else "MASTER BYPASS: INACTIVE (EFFECTS ON)")
+            self.btn_global_bypass.blockSignals(False)
 
-        self.update_master_accent_theme(self._active_ab)
+            self.update_master_accent_theme(self._active_ab)
 
-        for ins in inserts:
-            if hasattr(ins, 'set_master_bypassed'):
-                ins.set_master_bypassed(is_bypass)
+            for ins in inserts:
+                if hasattr(ins, 'set_master_bypassed'):
+                    ins.set_master_bypassed(is_bypass)
 
-        if hasattr(self, 'histogram') and hasattr(self.histogram, 'set_master_bypass'):
-            self.histogram.set_master_bypass(is_bypass)
+            if hasattr(self, 'histogram') and hasattr(self.histogram, 'set_master_bypass'):
+                self.histogram.set_master_bypass(is_bypass)
 
-        self._last_dispatched_params = None
+            self._last_dispatched_params = None
+        finally:
+            self._is_applying_state = False
         self.trigger_render_immediate()
 
     def _populate_presets_combo(self):

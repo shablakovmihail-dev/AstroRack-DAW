@@ -46,6 +46,38 @@ class AstroEngine:
     _B3_KERNEL = np.array([1, 4, 6, 4, 1], dtype=np.float32) / 16.0
 
     @staticmethod
+    def _sparse_b3_convolve1d(arr: np.ndarray, step: int, axis: int) -> np.ndarray:
+        """1D sparse B3-сплайн свертка вдоль оси axis через np.pad(mode='symmetric') и strided views.
+
+        Сложность строго константная O(N) независимо от шага step (номера слоя вейвлета).
+        """
+        w0 = np.float32(1.0 / 16.0)
+        w1 = np.float32(4.0 / 16.0)
+        w2 = np.float32(6.0 / 16.0)
+
+        pad_width = [(0, 0)] * arr.ndim
+        pad_width[axis] = (2 * step, 2 * step)
+        pad_arr = np.pad(arr, pad_width, mode='symmetric')
+
+        def _sl(st, en):
+            s = [slice(None)] * arr.ndim
+            s[axis] = slice(st, en)
+            return tuple(s)
+
+        c = pad_arr[_sl(2 * step, -2 * step)]
+        l1 = pad_arr[_sl(step, -3 * step)]
+        r1 = pad_arr[_sl(3 * step, -step)]
+        l2 = pad_arr[_sl(0, -4 * step)]
+        r2 = pad_arr[_sl(4 * step, None)]
+
+        out = np.empty_like(arr)
+        np.add(l1, r1, out=out)
+        np.multiply(out, w1, out=out)
+        out += w2 * c
+        out += w0 * (l2 + r2)
+        return out
+
+    @staticmethod
     def normalize_layers_config(layers_config=None, legacy_l1: float = 1.0, legacy_l2: float = 1.0,
                                 legacy_denoise: float = 0.0) -> list:
         """Приводит конфиг слоёв к списку словарей {"amount", "denoise", "mode"} длиной 1..6.
@@ -96,21 +128,14 @@ class AstroEngine:
         cancel_check — необязательный callable, возвращающий True для досрочной отмены (тогда None).
         """
         n_layers = int(np.clip(n_layers, AstroEngine.WAVELET_MIN_LAYERS, AstroEngine.WAVELET_MAX_LAYERS))
-        base = AstroEngine._B3_KERNEL
         details = []
         current = img
         for level in range(n_layers):
             step = 2 ** level
-            if step == 1:
-                kernel = base
-            else:
-                kernel = np.zeros(4 * step + 1, dtype=np.float32)
-                kernel[0::step] = base
-
-            smooth = convolve1d(current, kernel, axis=0, mode='reflect')
+            smooth = AstroEngine._sparse_b3_convolve1d(current, step, axis=0)
             if cancel_check is not None and cancel_check():
                 return None
-            smooth = convolve1d(smooth, kernel, axis=1, mode='reflect')
+            smooth = AstroEngine._sparse_b3_convolve1d(smooth, step, axis=1)
             if cancel_check is not None and cancel_check():
                 return None
 
@@ -121,20 +146,36 @@ class AstroEngine:
 
     @staticmethod
     def atrous_recompose(residual: np.ndarray, details: list, layers: list) -> np.ndarray:
-        """Сборка: residual + sum(amount_k * threshold_k(w_k)). Порог пропускается при denoise == 0."""
+        """Сборка: residual + sum(amount_k * threshold_k(w_k)) с минимальными аллокациями."""
         out = residual.astype(np.float32, copy=True)
+        w_buf = None
         for w, cfg in zip(details, layers):
-            if cfg["denoise"] > 0.0:
-                thresh = np.float32(cfg["denoise"] * AstroEngine.WAVELET_DENOISE_SCALE)
+            denoise = cfg["denoise"]
+            amount = np.float32(cfg["amount"])
+            if denoise > 0.0:
+                thresh = np.float32(denoise * AstroEngine.WAVELET_DENOISE_SCALE)
+                if w_buf is None or w_buf.shape != w.shape:
+                    w_buf = np.empty_like(w)
                 if cfg["mode"] == "hard":
-                    w = np.where(np.abs(w) >= thresh, w, np.float32(0.0))
+                    np.copyto(w_buf, w)
+                    mask = np.abs(w) < thresh
+                    w_buf[mask] = 0.0
                 else:
-                    w = np.sign(w) * np.maximum(np.abs(w) - thresh, np.float32(0.0))
-            amount = cfg["amount"]
-            if abs(amount - 1.0) < 1e-6:
-                out += w
+                    np.abs(w, out=w_buf)
+                    np.subtract(w_buf, thresh, out=w_buf)
+                    np.maximum(w_buf, 0.0, out=w_buf)
+                    neg = w < 0
+                    w_buf[neg] = -w_buf[neg]
+
+                if abs(amount - 1.0) < 1e-6:
+                    out += w_buf
+                else:
+                    cv2.scaleAdd(w_buf, amount, out, dst=out)
             else:
-                out += w * np.float32(amount)
+                if abs(amount - 1.0) < 1e-6:
+                    out += w
+                else:
+                    cv2.scaleAdd(w, amount, out, dst=out)
         return out
 
     @staticmethod

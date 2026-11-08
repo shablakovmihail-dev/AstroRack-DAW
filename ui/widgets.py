@@ -6,7 +6,7 @@ import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRectF, QTimer, QObject, QEvent, QDate, QSize
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QLabel, QSlider, QCheckBox, QPushButton, QDialog,
-    QToolButton, QDoubleSpinBox, QDateEdit, QRadioButton, QVBoxLayout, QHBoxLayout, QMessageBox, QComboBox,
+    QToolButton, QDoubleSpinBox, QSpinBox, QDateEdit, QRadioButton, QVBoxLayout, QHBoxLayout, QMessageBox, QComboBox,
     QMenu, QToolTip,
     QStyledItemDelegate,
     QSizePolicy, QButtonGroup
@@ -278,7 +278,78 @@ class HelpIcon(QToolButton):
         self._apply_style()
 
 
-class PlanetarySlider(QSlider):
+class HoverDwellWheelMixin:
+    """Миксин для защиты от случайной прокрутки параметров колесиком мыши:
+    «Клик ЛИБО задержка наведения (Hover Dwell)».
+
+    Контрол реагирует на колесико ТОЛЬКО если:
+    1. Элемент уже имеет активный фокус (self.hasFocus() — был клик).
+    2. Курсор задержан над элементом непрерывно дольше 250 мс (Hover Dwell).
+    Если ни одно условие не выполнено — вызывать event.ignore(), чтобы событие колесика
+    беспрепятственно прокручивало родительский QScrollArea.
+    """
+    _HOVER_DWELL_MS = 250
+
+    def _init_hover_dwell(self):
+        self._wheel_enabled = False
+        self._hover_dwell_timer = QTimer(self)
+        self._hover_dwell_timer.setSingleShot(True)
+        self._hover_dwell_timer.setInterval(self._HOVER_DWELL_MS)
+        self._hover_dwell_timer.timeout.connect(self._on_hover_dwell_timeout)
+
+    def _on_hover_dwell_timeout(self):
+        self._wheel_enabled = True
+
+    def enterEvent(self, event):
+        if not hasattr(self, '_hover_dwell_timer'):
+            self._init_hover_dwell()
+        self._wheel_enabled = False
+        self._hover_dwell_timer.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if hasattr(self, '_hover_dwell_timer'):
+            self._hover_dwell_timer.stop()
+        self._wheel_enabled = False
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        self._wheel_enabled = True
+        self.setFocus()
+        super().mousePressEvent(event)
+
+    def wheelEvent(self, event):
+        if self.hasFocus() or getattr(self, '_wheel_enabled', False):
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class AstroDoubleSpinBox(HoverDwellWheelMixin, QDoubleSpinBox):
+    """QDoubleSpinBox с защитой от случайного скролла: клик ЛИБО hover dwell 250 мс."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._init_hover_dwell()
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+
+class AstroSpinBox(HoverDwellWheelMixin, QSpinBox):
+    """QSpinBox с защитой от случайного скролла: клик ЛИБО hover dwell 250 мс."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._init_hover_dwell()
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+
+class AstroComboBox(HoverDwellWheelMixin, QComboBox):
+    """QComboBox с защитой от случайного скролла: клик ЛИБО hover dwell 250 мс."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._init_hover_dwell()
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+
+class PlanetarySlider(HoverDwellWheelMixin, QSlider):
     """
     Кастомный слайдер Солнечной системы:
     Размер ручки: от 8 px (Меркурий) до 22 px (Юпитер).
@@ -292,10 +363,12 @@ class PlanetarySlider(QSlider):
 
     def __init__(self, orientation=Qt.Orientation.Horizontal, parent=None):
         super().__init__(orientation, parent)
+        self._init_hover_dwell()
         self.setRange(0, 10000)
         self.setMouseTracking(True)
         self.setFixedHeight(22)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._theme = THEMES['A']
 
     def set_theme(self, theme: dict):
@@ -314,10 +387,19 @@ class PlanetarySlider(QSlider):
     def mousePressEvent(self, event):
         if not self.isEnabled():
             return
+        self._wheel_enabled = True
+        self.setFocus()
         if event.button() == Qt.MouseButton.LeftButton:
             self._update_from_mouse(event.pos().x())
             event.accept()
         super().mousePressEvent(event)
+
+    def wheelEvent(self, event):
+        if self.hasFocus() or getattr(self, '_wheel_enabled', False):
+            super().wheelEvent(event)
+            self.sliderReleased.emit()
+        else:
+            event.ignore()
 
     def mouseMoveEvent(self, event):
         if not self.isEnabled():
@@ -547,7 +629,7 @@ class AstroParamRow(QWidget):
         self.slider.setEnabled(not self.has_sub_bypass)
         self.slider.sliderReleased.connect(self.paramCommitted.emit)
 
-        self.spinbox = QDoubleSpinBox()
+        self.spinbox = AstroDoubleSpinBox()
         self.spinbox.setRange(min_val, max_val)
         self.spinbox.setSingleStep(step)
         self.spinbox.setDecimals(decimals)
@@ -749,7 +831,7 @@ class _RotaryDummyButton:
         self._knob.reset_default()
 
 
-class RotaryKnob(QWidget):
+class RotaryKnob(HoverDwellWheelMixin, QWidget):
     """
     Компактная микшерная крутилка (Rotary Knob) в стиле DAW для регулировки Dry/Wet.
     Фиксированный размер: 24x24 px.
@@ -761,13 +843,16 @@ class RotaryKnob(QWidget):
     """
     valueChanged = pyqtSignal(int)      # 0 .. 100
     mixChanged = pyqtSignal(float)      # 0.0 .. 1.0
+    sliderReleased = pyqtSignal()
 
     def __init__(self, parent=None, default_val: int = 100):
         super().__init__(parent)
+        self._init_hover_dwell()
         self.setObjectName("RotaryKnob")
         self.setFixedSize(24, 24)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self._val = int(np.clip(default_val, 0, 100))
         self.default_val = self._val
@@ -823,15 +908,20 @@ class RotaryKnob(QWidget):
 
     def reset_default(self, *args):
         self.set_value(self.default_val)
+        self.sliderReleased.emit()
 
     def mousePressEvent(self, event):
         if not self.isEnabled():
             return
+        self._wheel_enabled = True
+        self.setFocus()
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = True
             self._drag_start_y = event.pos().y()
             self._drag_start_val = self._val
             event.accept()
+        else:
+            super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if not self.isEnabled():
@@ -849,6 +939,7 @@ class RotaryKnob(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
+            self.sliderReleased.emit()
             event.accept()
         super().mouseReleaseEvent(event)
 
@@ -863,6 +954,9 @@ class RotaryKnob(QWidget):
             super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event):
+        if not (self.hasFocus() or getattr(self, '_wheel_enabled', False)):
+            event.ignore()
+            return
         if not self.isEnabled():
             return
         delta = event.angleDelta().y()
@@ -872,6 +966,7 @@ class RotaryKnob(QWidget):
                 step = 1 if delta > 0 else -1
             self.set_value(self._val + step)
             self._show_static_tooltip()
+            self.sliderReleased.emit()
             event.accept()
         else:
             super().wheelEvent(event)
@@ -1018,7 +1113,8 @@ class _DryWetRowAdapter(QObject):
         self._ctrl = ctrl
         if ctrl is not None:
             ctrl.valueChanged.connect(lambda v: self.valueChanged.emit(float(v)))
-            ctrl.valueChanged.connect(lambda _: self.paramCommitted.emit())
+            if hasattr(ctrl, 'sliderReleased'):
+                ctrl.sliderReleased.connect(self.paramCommitted.emit)
 
     def get_actual_value(self) -> float:
         return float(self._ctrl.value()) if self._ctrl is not None else 100.0
@@ -1708,7 +1804,7 @@ class WaveletInsert(CollapsibleInsertBox):
         mode_hbox.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.lbl_mode = QLabel("Mode:")
         self.lbl_mode.setStyleSheet("color: #00adb5; font-size: 10px; font-weight: bold;")
-        self.combo_mode = QComboBox()
+        self.combo_mode = AstroComboBox()
         self.combo_mode.setFixedHeight(22)
         self.combo_mode.addItems(["Wavelet (à trous)", "Unsharp Mask"])
         self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
@@ -1809,7 +1905,7 @@ class WaveletInsert(CollapsibleInsertBox):
             return False
         w = WaveletLayerWidget(self.layer_count() + 1)
         w.changed.connect(self.slider_changed.emit)
-        w.bypassChanged.connect(self.bypass_toggled.emit)
+        w.bypassChanged.connect(self.slider_changed.emit)
         w.committed.connect(self.state_committed.emit)
         self.layers_container.addWidget(w)
         self.layer_widgets.append(w)
@@ -2185,7 +2281,7 @@ class LocalContrastInsert(CollapsibleInsertBox):
         mode_hbox.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.lbl_mode = QLabel("Mode:")
         self.lbl_mode.setStyleSheet("color: #00adb5; font-size: 10px; font-weight: bold;")
-        self.combo_mode = QComboBox()
+        self.combo_mode = AstroComboBox()
         self.combo_mode.setFixedHeight(22)
         self.combo_mode.addItems(["CLAHE (Local Histogram)", "High-Pass (Macro Blur)"])
         self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
@@ -3620,9 +3716,9 @@ def format_clipping_text(count: int, percent: float) -> str:
         return f"{percent:.3f}% ({count:,} px)"
 
 
-def compute_clipping_metrics(img: np.ndarray, roi_mask: Optional[np.ndarray] = None) -> dict:
+def compute_clipping_metrics(img: np.ndarray, roi_mask: Optional[np.ndarray] = None, max_samples: int = 131072) -> dict:
     """
-    Точный векторный расчёт выбитых пикселей:
+    Векторный расчёт выбитых пикселей с автоматическим субдискретизированием:
     - Shadows: brightness <= 0.001
     - Highlights: brightness >= 0.999
     """
@@ -3637,44 +3733,57 @@ def compute_clipping_metrics(img: np.ndarray, roi_mask: Optional[np.ndarray] = N
             'total_pixels': 0,
         }
 
-    is_float = np.issubdtype(img.dtype, np.floating)
-    if img.ndim == 3 and img.shape[2] >= 3:
-        r = img[:, :, 0].astype(np.float32)
-        g = img[:, :, 1].astype(np.float32)
-        b = img[:, :, 2].astype(np.float32)
-        if not is_float or img.max() > 1.0:
+    orig_total = img.shape[0] * img.shape[1]
+    if orig_total > max_samples:
+        step = max(1, int(np.sqrt(orig_total / max_samples)))
+        img_sample = img[::step, ::step]
+        roi_sample = roi_mask[::step, ::step] if (roi_mask is not None and roi_mask.shape == img.shape[:2]) else roi_mask
+    else:
+        img_sample = img
+        roi_sample = roi_mask
+
+    is_float = np.issubdtype(img_sample.dtype, np.floating)
+    if img_sample.ndim == 3 and img_sample.shape[2] >= 3:
+        r = img_sample[:, :, 0].astype(np.float32)
+        g = img_sample[:, :, 1].astype(np.float32)
+        b = img_sample[:, :, 2].astype(np.float32)
+        if not is_float or img_sample.max() > 1.0:
             r = r / 255.0
             g = g / 255.0
             b = b / 255.0
         lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
     else:
-        mono = img[:, :, 0] if (img.ndim == 3 and img.shape[2] == 1) else img
+        mono = img_sample[:, :, 0] if (img_sample.ndim == 3 and img_sample.shape[2] == 1) else img_sample
         lum = mono.astype(np.float32)
-        if not is_float or img.max() > 1.0:
+        if not is_float or img_sample.max() > 1.0:
             lum = lum / 255.0
 
-    if roi_mask is not None and np.any(roi_mask):
-        calc_lum = lum[roi_mask > 0]
+    if roi_sample is not None and np.any(roi_sample):
+        calc_lum = lum[roi_sample > 0]
         if calc_lum.size == 0:
             calc_lum = lum.ravel()
     else:
         calc_lum = lum.ravel()
 
-    total_px = max(1, calc_lum.size)
-    shadow_count = int(np.count_nonzero(calc_lum <= 0.001))
-    shadow_pct = (shadow_count / float(total_px)) * 100.0
+    sample_total = max(1, calc_lum.size)
+    shadow_raw = int(np.count_nonzero(calc_lum <= 0.001))
+    shadow_pct = (shadow_raw / float(sample_total)) * 100.0
 
-    highlight_count = int(np.count_nonzero(calc_lum >= 0.999))
-    highlight_pct = (highlight_count / float(total_px)) * 100.0
+    highlight_raw = int(np.count_nonzero(calc_lum >= 0.999))
+    highlight_pct = (highlight_raw / float(sample_total)) * 100.0
+
+    scale_factor = float(orig_total) / float(sample_total)
+    shadow_count = int(round(shadow_raw * scale_factor))
+    highlight_count = int(round(highlight_raw * scale_factor))
 
     return {
         'shadow_count': shadow_count,
         'shadow_pct': shadow_pct,
-        'shadow_clip': shadow_count > 0,
+        'shadow_clip': shadow_raw > 0,
         'highlight_count': highlight_count,
         'highlight_pct': highlight_pct,
-        'highlight_clip': highlight_count > 0,
-        'total_pixels': total_px,
+        'highlight_clip': highlight_raw > 0,
+        'total_pixels': orig_total,
     }
 
 
@@ -4106,7 +4215,6 @@ class AstroHistogramWidget(QWidget):
         # Выделение полезного сигнала объекта в режиме AUTO (Auto-Mask ROI)
         use_mask = False
         mask = None
-        full_mask = None
         if self._roi_mode == "AUTO":
             gray_u8 = np.clip(lum_255, 0.0, 255.0).astype(np.uint8)
             try:
@@ -4125,10 +4233,6 @@ class AstroHistogramWidget(QWidget):
                         cv2.drawContours(mask, [c], -1, 255, thickness=-1)
                         if np.any(mask > 0):
                             use_mask = True
-                            if total_px > 65536:
-                                full_mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
-                            else:
-                                full_mask = mask
             except Exception:
                 use_mask = False
 
@@ -4164,8 +4268,21 @@ class AstroHistogramWidget(QWidget):
             self._raw_hist_g = self._raw_hist_lum.copy()
             self._raw_hist_b = self._raw_hist_lum.copy()
 
-        # Точный векторный расчёт выбитых пикселей на полном разрешении кадра
-        metrics = compute_clipping_metrics(img, roi_mask=full_mask if use_mask else None)
+        # Точный векторный расчёт выбитых пикселей на сабсэмпле кадра (без 4K аллокации маски 8.3 МБ)
+        roi_for_metrics = None
+        if use_mask and mask is not None:
+            max_samples = 131072
+            if total_px > max_samples:
+                step_clip = max(1, int(np.sqrt(total_px / max_samples)))
+                clip_shape = img[::step_clip, ::step_clip].shape[:2]
+                if mask.shape != clip_shape:
+                    roi_for_metrics = cv2.resize(mask, (clip_shape[1], clip_shape[0]), interpolation=cv2.INTER_NEAREST)
+                else:
+                    roi_for_metrics = mask
+            else:
+                roi_for_metrics = mask
+
+        metrics = compute_clipping_metrics(img, roi_mask=roi_for_metrics)
         self._shadow_count = metrics['shadow_count']
         self._shadow_clip_pct = metrics['shadow_pct']
         self._shadow_clip = metrics['shadow_clip']

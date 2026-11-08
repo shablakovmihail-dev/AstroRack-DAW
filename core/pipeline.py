@@ -1,5 +1,8 @@
 #"""Фоновый поток (Worker QThread) обработки кадров с отменой задач и кэшированием стадий."""
+from collections import OrderedDict
+import concurrent.futures
 import threading
+from typing import Optional, Tuple
 import cv2
 import numpy as np
 from scipy.ndimage import convolve1d, gaussian_filter
@@ -8,13 +11,44 @@ from .processing import AstroEngine, soft_clip_limiter
 from .enhance import apply_local_contrast, apply_color_engine
 
 
-def blend_dry_wet(dry_img: np.ndarray, wet_img: np.ndarray, wet_ratio: float = 1.0) -> np.ndarray:
+def _lru_get(d: OrderedDict, key):
+    if key in d:
+        d.move_to_end(key)
+        return d[key]
+    return None
+
+
+def _lru_set(d: OrderedDict, key, value, max_size: int = 4):
+    d[key] = value
+    d.move_to_end(key)
+    while len(d) > max_size:
+        d.popitem(last=False)
+
+
+def _get_free_cache_buffer(d: OrderedDict, shape, dtype, max_size: int = 4) -> Optional[np.ndarray]:
+    """Возвращает свободный буфер из вытесняемой записи LRU-кэша для переиспользования памяти."""
+    if len(d) >= max_size:
+        oldest_key = next(iter(d))
+        oldest_val = d[oldest_key]
+        if (
+            isinstance(oldest_val, np.ndarray)
+            and oldest_val.shape == shape
+            and oldest_val.dtype == dtype
+            and oldest_val.flags['C_CONTIGUOUS']
+        ):
+            return oldest_val
+    return None
+
+
+def blend_dry_wet(dry_img: np.ndarray, wet_img: np.ndarray, wet_ratio: float = 1.0,
+                  dst: Optional[np.ndarray] = None) -> np.ndarray:
     """Универсальная быстрая функция параллельного линейного подмешивания Dry/Wet (float32/uint8).
 
     Параметры:
         dry_img: входной необработанный массив (Dry).
         wet_img: обработанный массив инсерта (Wet).
         wet_ratio: коэффициент от 0.0 (100% dry) до 1.0 (100% wet), либо в процентах 0..100.
+        dst: опциональный предвыделенный буфер для записи результата (устраняет аллокацию).
 
     Возвращает:
         Результирующий массив с той же размерностью и dtype, что и wet_img.
@@ -57,6 +91,15 @@ def blend_dry_wet(dry_img: np.ndarray, wet_img: np.ndarray, wet_ratio: float = 1
     if not dry_c.flags['C_CONTIGUOUS']:
         dry_c = np.ascontiguousarray(dry_c)
 
+    # Проверка совместимости предвыделенного буфера dst
+    if (
+        dst is not None
+        and dst.shape == wet_c.shape
+        and dst.dtype == wet_c.dtype
+        and dst.flags['C_CONTIGUOUS']
+    ):
+        return cv2.addWeighted(wet_c, float(ratio), dry_c, float(1.0 - ratio), 0.0, dst=dst)
+
     return cv2.addWeighted(wet_c, float(ratio), dry_c, float(1.0 - ratio), 0.0)
 
 
@@ -76,6 +119,7 @@ def _extract_wet_ratio(params: dict, *keys, default: float = 1.0) -> float:
 class PipelineWorker(QObject):
     """Worker, выполняющий расчет цепочки инсертов в фоновом потоке с поэтапным кэшированием."""
     frame_ready = pyqtSignal(np.ndarray)
+    roi_frame_ready = pyqtSignal(np.ndarray, object)
     rgb_shifts_computed = pyqtSignal(float, float, float, float)
     _wake_worker = pyqtSignal()
 
@@ -90,30 +134,37 @@ class PipelineWorker(QObject):
         # Поэтапные кэши цепочки обработки
         self._clear_caches()
 
+        # Пул фоновых потоков для параллелизации вычислений по RGB-каналам
+        self._thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
+        # Инициализация и проверка доступности аппаратного ускорения OpenCL
+        self._has_ocl = False
+        try:
+            if cv2.ocl.haveOpenCL():
+                cv2.ocl.setUseOpenCL(True)
+                self._has_ocl = bool(cv2.ocl.useOpenCL())
+        except Exception:
+            self._has_ocl = False
+
         # Гарантированный запуск слота в фоновом потоке QThread через QueuedConnection
         self._wake_worker.connect(self._process_loop, Qt.ConnectionType.QueuedConnection)
 
     def _clear_caches(self):
         """Сброс всех промежуточных кэшей при смене исходного изображения."""
         self._cache_rgb_align = None          # (aligned_img, (dx_r, dy_r, dx_b, dy_b))
-        self._cache_stage4 = {}               # key4 -> img_after_insert4
+        self._cache_stage4 = OrderedDict()    # key4 -> img_after_insert4
 
-        self._cache_wavelet_decomp = None     # (key4, c2, w1, w2)
-        self._cache_unsharp_blur = None       # (key4, radius, blurred_img)
-        self._cache_stage1_wet = None         # (core_key1, wet_img)
-        self._cache_stage1 = None             # (key1, img_after_insert1)
-        self._cache_stage1_active = None      # (active_key1, img_after_insert1)
+        self._cache_wavelet_decomp = OrderedDict()  # decomp_key -> (residual, details)
+        self._cache_unsharp_blur = OrderedDict()    # blur_key -> blurred_img
+        self._cache_stage1_wet = OrderedDict()      # core_key1 -> wet_img
+        self._cache_stage1 = OrderedDict()          # key1 -> img_after_insert1
 
-        self._cache_rl_core = None            # (key1, sigma, iters, rl_estimate)
-        self._cache_rl_edge_mask = None       # (key1, edge_mask)
-        self._cache_stage2_wet = None         # (core_key2, wet_img)
-        self._cache_stage2 = None             # (key2, img_after_insert2)
-        self._cache_stage2_active = None      # (active_key2, img_after_insert2)
+        self._cache_rl_core = OrderedDict()         # rl_core_key -> (iters, rl_estimate)
+        self._cache_rl_edge_mask = OrderedDict()    # key1 -> edge_mask
+        self._cache_stage2_wet = OrderedDict()      # core_key2 -> wet_img
+        self._cache_stage2 = OrderedDict()          # key2 -> img_after_insert2
 
-        self._cache_stage3 = None             # (key3, img_after_insert3)
-        self._cache_stage3_active = None      # (active_key3, img_after_insert3)
-
-        self._stage_cache = {}                # slot -> (key, img): Insert 5 / Insert 6
+        self._stage_cache = {}                      # slot -> OrderedDict(key -> img)
 
     def cancel_current(self):
         """Немедленно помечает текущий расчет как устаревший."""
@@ -138,13 +189,15 @@ class PipelineWorker(QObject):
             self._pending_params = None
             self._clear_caches()
 
-    def request_processing(self, params: dict):
+    def request_processing(self, params: dict, roi_rect: Optional[tuple[int, int, int, int]] = None):
         """Ставит новый запрос в очередь с отменой предыдущего незавершенного расчета."""
         if params is None:
             return
         with self._lock:
             self._task_id += 1
             self._pending_params = params.copy()
+            if roi_rect is not None:
+                self._pending_params['_roi_rect'] = roi_rect
             should_wake = not self._is_busy
         if should_wake:
             self._wake_worker.emit()
@@ -179,9 +232,22 @@ class PipelineWorker(QObject):
                 task_id = self._task_id
                 raw_img = self._raw_image
 
-            result = self._execute_pipeline(raw_img, params, task_id)
-            if result is not None and not self._is_cancelled(task_id):
-                self.frame_ready.emit(result)
+            is_preview = bool(params.get('_preview', False))
+            roi_rect = params.get('_roi_rect', None)
+
+            if is_preview and roi_rect is not None:
+                # Viewport RoI: расчет на нативном фрагменте 4K без масштабирования
+                rx, ry, rw, rh = roi_rect
+                input_img = raw_img[ry:ry+rh, rx:rx+rw].copy()
+                result = self._execute_pipeline(input_img, params, task_id)
+                if result is not None and not self._is_cancelled(task_id):
+                    self.roi_frame_ready.emit(result, roi_rect)
+            else:
+                # Полнокадровый расчет (Fit-to-Screen или чистовой Full-Res коммит)
+                input_img = raw_img
+                result = self._execute_pipeline(input_img, params, task_id)
+                if result is not None and not self._is_cancelled(task_id):
+                    self.frame_ready.emit(result)
 
     def _execute_pipeline(self, raw_img: np.ndarray, params: dict, task_id: int):
         if raw_img is None or raw_img.size == 0 or self._is_cancelled(task_id):
@@ -197,7 +263,7 @@ class PipelineWorker(QObject):
         ins4_on = bool(params.get('insert4_enabled', False))
         do_align = ins4_on and bool(params.get('auto_rgb_align', False))
         do_green = ins4_on and bool(params.get('extract_green', False))
-        key4 = (do_align, do_green)
+        key4 = (do_align, do_green, raw_img.shape[:2])
 
         if key4 in self._cache_stage4:
             stage4_img = self._cache_stage4[key4]
@@ -244,15 +310,13 @@ class PipelineWorker(QObject):
         # Динамический конфиг слоёв: params['layers_config'] или старые w_l1/w_l2/w_denoise (2 слоя)
         w_layers = None
         if w_mode == 0:
-            w_layers = AstroEngine.trim_neutral_layers(
-                AstroEngine.normalize_layers_config(
-                    params.get('layers_config'), w_l1, w_l2, w_denoise
-                )
+            w_layers = AstroEngine.normalize_layers_config(
+                params.get('layers_config'), w_l1, w_l2, w_denoise
             )
 
         if w_mode == 0:
-            ins1_neutral = not ins1_on or (
-                len(w_layers) == 1 and abs(w_layers[0]["amount"] - 1.0) < 1e-4 and w_layers[0]["denoise"] <= 1e-5
+            ins1_neutral = not ins1_on or all(
+                abs(l["amount"] - 1.0) < 1e-4 and l["denoise"] <= 1e-5 for l in w_layers
             )
         else:
             ins1_neutral = not ins1_on or abs(w_l1 - 1.0) < 1e-4
@@ -268,26 +332,22 @@ class PipelineWorker(QObject):
 
             key1 = (core_key1, round(w_wet_ratio, 4))
 
-            if self._cache_stage1 is not None and self._cache_stage1[0] == key1:
-                stage1_img = self._cache_stage1[1]
-            elif self._cache_stage1_active is not None and self._cache_stage1_active[0] == key1:
-                stage1_img = self._cache_stage1_active[1]
+            cached_s1 = _lru_get(self._cache_stage1, key1)
+            if cached_s1 is not None:
+                stage1_img = cached_s1
             else:
-                # Извлечение или вычисление неразбавленного wet-изображения
-                if self._cache_stage1_wet is not None and self._cache_stage1_wet[0] == core_key1:
-                    stage1_wet = self._cache_stage1_wet[1]
-                else:
+                stage1_wet = _lru_get(self._cache_stage1_wet, core_key1)
+                if stage1_wet is None:
                     stage1_wet = self._compute_stage1(stage4_img, key4, w_mode, w_l1, w_l2, w_denoise, task_id,
                                                       layers=w_layers)
                     if stage1_wet is None:
                         return None
-                    self._cache_stage1_wet = (core_key1, stage1_wet)
+                    _lru_set(self._cache_stage1_wet, core_key1, stage1_wet, max_size=4)
 
                 # Параллельное подмешивание Dry/Wet
-                stage1_img = blend_dry_wet(stage4_img, stage1_wet, w_wet_ratio)
-                self._cache_stage1_active = (key1, stage1_img)
-
-        self._cache_stage1 = (key1, stage1_img)
+                dst_buf1 = _get_free_cache_buffer(self._cache_stage1, stage1_wet.shape, stage1_wet.dtype)
+                stage1_img = blend_dry_wet(stage4_img, stage1_wet, w_wet_ratio, dst=dst_buf1)
+                _lru_set(self._cache_stage1, key1, stage1_img, max_size=4)
 
         if self._is_cancelled(task_id):
             return None
@@ -307,39 +367,37 @@ class PipelineWorker(QObject):
             stage2_img = stage1_img
         else:
             full_core_key2 = (key1, rl_sigma, rl_iters, rl_anti_ringing)
-            eff_iters = min(rl_iters, 5) if is_preview else rl_iters
+            eff_iters = min(rl_iters, 2) if is_preview else rl_iters
             core_key2 = (key1, rl_sigma, eff_iters, rl_anti_ringing)
 
             key2 = (core_key2, round(rl_wet_ratio, 4))
             full_key2 = (full_core_key2, round(rl_wet_ratio, 4))
 
-            # Если уже есть точный кэш для полного числа итераций с данным wet_mix
-            if self._cache_stage2 is not None and self._cache_stage2[0] in (key2, full_key2):
-                stage2_img = self._cache_stage2[1]
-            elif self._cache_stage2_active is not None and self._cache_stage2_active[0] == full_key2:
-                stage2_img = self._cache_stage2_active[1]
+            cached_s2 = _lru_get(self._cache_stage2, full_key2)
+            if cached_s2 is None:
+                cached_s2 = _lru_get(self._cache_stage2, key2)
+
+            if cached_s2 is not None:
+                stage2_img = cached_s2
             else:
-                if self._cache_stage2_wet is not None and self._cache_stage2_wet[0] == full_core_key2:
-                    stage2_wet = self._cache_stage2_wet[1]
-                elif self._cache_stage2_wet is not None and self._cache_stage2_wet[0] == core_key2:
-                    stage2_wet = self._cache_stage2_wet[1]
-                else:
+                stage2_wet = _lru_get(self._cache_stage2_wet, full_core_key2)
+                if stage2_wet is None:
+                    stage2_wet = _lru_get(self._cache_stage2_wet, core_key2)
+                if stage2_wet is None:
                     stage2_wet = self._compute_stage2(
-                        stage1_img, key1, rl_sigma, eff_iters, rl_anti_ringing, task_id
+                        stage1_img, key1, rl_sigma, eff_iters, rl_anti_ringing, task_id,
+                        prefer_umat=bool(params.get('prefer_umat', False))
                     )
                     if stage2_wet is None:
                         return None
-                    if not is_preview or eff_iters == rl_iters:
-                        self._cache_stage2_wet = (full_core_key2, stage2_wet)
-                    else:
-                        self._cache_stage2_wet = (core_key2, stage2_wet)
+                    save_core_key = full_core_key2 if (not is_preview or eff_iters == rl_iters) else core_key2
+                    _lru_set(self._cache_stage2_wet, save_core_key, stage2_wet, max_size=4)
 
                 # Параллельное подмешивание Dry/Wet
-                stage2_img = blend_dry_wet(stage1_img, stage2_wet, rl_wet_ratio)
-                if not is_preview or eff_iters == rl_iters:
-                    self._cache_stage2_active = (full_key2, stage2_img)
-
-        self._cache_stage2 = (key2, stage2_img)
+                dst_buf2 = _get_free_cache_buffer(self._cache_stage2, stage2_wet.shape, stage2_wet.dtype)
+                stage2_img = blend_dry_wet(stage1_img, stage2_wet, rl_wet_ratio, dst=dst_buf2)
+                save_key2 = full_key2 if (not is_preview or eff_iters == rl_iters) else key2
+                _lru_set(self._cache_stage2, save_key2, stage2_img, max_size=4)
 
         if self._is_cancelled(task_id):
             return None
@@ -399,9 +457,10 @@ class PipelineWorker(QObject):
             core_key5 = (key3, 'lc', lc_is_hp, lc_amount, lc_radius)
             key5 = (core_key5, round(lc_wet_ratio, 4))
 
-            cached5 = self._stage_cache.get('stage5')
-            if cached5 is not None and cached5[0] == key5:
-                stage5_img = cached5[1]
+            slot5 = self._stage_cache.setdefault('stage5', OrderedDict())
+            cached5 = _lru_get(slot5, key5)
+            if cached5 is not None:
+                stage5_img = cached5
             else:
                 stage5_wet = self._run_cached_stage(
                     'stage5_wet', core_key5,
@@ -413,8 +472,9 @@ class PipelineWorker(QObject):
                 if stage5_wet is None:
                     return None
                 # Параллельное подмешивание Dry/Wet
-                stage5_img = blend_dry_wet(stage3_img, stage5_wet, lc_wet_ratio)
-                self._stage_cache['stage5'] = (key5, stage5_img)
+                dst_buf5 = _get_free_cache_buffer(slot5, stage5_wet.shape, stage5_wet.dtype)
+                stage5_img = blend_dry_wet(stage3_img, stage5_wet, lc_wet_ratio, dst=dst_buf5)
+                _lru_set(slot5, key5, stage5_img, max_size=4)
 
         # =====================================================================
         # СТАДИЯ 6 (Insert 6): Color Engine & Background Neutralization
@@ -442,9 +502,10 @@ class PipelineWorker(QObject):
             core_key6 = (key5, 'cs', cs_sat, cs_mineral, cs_bg, cs_coords)
             key6 = (core_key6, round(cs_wet_ratio, 4))
 
-            cached6 = self._stage_cache.get('stage6')
-            if cached6 is not None and cached6[0] == key6:
-                stage6_img = cached6[1]
+            slot6 = self._stage_cache.setdefault('stage6', OrderedDict())
+            cached6 = _lru_get(slot6, key6)
+            if cached6 is not None:
+                stage6_img = cached6
             else:
                 stage6_wet = self._run_cached_stage(
                     'stage6_wet', core_key6,
@@ -453,8 +514,9 @@ class PipelineWorker(QObject):
                 )
                 if stage6_wet is None:
                     return None
-                stage6_img = blend_dry_wet(stage5_img, stage6_wet, cs_wet_ratio)
-                self._stage_cache['stage6'] = (key6, stage6_img)
+                dst_buf6 = _get_free_cache_buffer(slot6, stage6_wet.shape, stage6_wet.dtype)
+                stage6_img = blend_dry_wet(stage5_img, stage6_wet, cs_wet_ratio, dst=dst_buf6)
+                _lru_set(slot6, key6, stage6_img, max_size=4)
 
         # =====================================================================
         # MASTER BUS OUTPUT: Master Soft-Clip Limiter
@@ -466,32 +528,30 @@ class PipelineWorker(QObject):
         limiter_thresh = float(params.get('limiter_threshold', 0.88))
         key_limiter = (key6, 'master_limiter', round(limiter_thresh, 4))
 
-        cached_limiter = self._stage_cache.get('master_limiter')
-        if cached_limiter is not None and cached_limiter[0] == key_limiter:
-            return cached_limiter[1]
+        slot_limiter = self._stage_cache.setdefault('master_limiter', OrderedDict())
+        cached_limiter = _lru_get(slot_limiter, key_limiter)
+        if cached_limiter is not None:
+            return cached_limiter
 
         if self._is_cancelled(task_id):
             return None
 
         limiter_img = soft_clip_limiter(stage6_img, threshold=limiter_thresh)
-        self._stage_cache['master_limiter'] = (key_limiter, limiter_img)
+        _lru_set(slot_limiter, key_limiter, limiter_img, max_size=4)
         return limiter_img
 
     def _run_cached_stage(self, slot: str, key, compute_fn, task_id: int):
-        """Одноэлементный кэш стадии: пересчёт только при смене ключа (вход + параметры).
-
-        Слот хранит последний реально вычисленный результат, поэтому переключение
-        байпаса инсерта вперёд-назад не приводит к повторному расчёту.
-        """
-        cached = self._stage_cache.get(slot)
-        if cached is not None and cached[0] == key:
-            return cached[1]
+        """Многоуровневый LRU-кэш стадии (глубина 4): пересчёт только при отсутствии в кэше."""
+        slot_cache = self._stage_cache.setdefault(slot, OrderedDict())
+        cached = _lru_get(slot_cache, key)
+        if cached is not None:
+            return cached
         if self._is_cancelled(task_id):
             return None
         result = compute_fn()
         if self._is_cancelled(task_id):
             return None
-        self._stage_cache[slot] = (key, result)
+        _lru_set(slot_cache, key, result, max_size=4)
         return result
 
     def _compute_stage1(self, img: np.ndarray, key4, w_mode: int,
@@ -499,35 +559,55 @@ class PipelineWorker(QObject):
         """Вейвлеты (1..6 слоёв) / Unsharp Mask с кэшированием декомпозиции слоев."""
         if w_mode == 0:
             if layers is None:
-                layers = AstroEngine.trim_neutral_layers(
-                    AstroEngine.normalize_layers_config(None, w_l1, w_l2, w_denoise)
-                )
-            n_layers = len(layers)
+                layers = AstroEngine.normalize_layers_config(None, w_l1, w_l2, w_denoise)
 
-            # Кэш декомпозиции зависит только от входа и числа слоёв (не от amount/denoise)
+            # Декомпозиция изолирована: выполняется строго на активное число слоёв (1..N)
+            n_layers = max(len(layers), 1)
             decomp_key = (key4, n_layers)
-            if self._cache_wavelet_decomp is not None and self._cache_wavelet_decomp[0] == decomp_key:
-                _, residual, details = self._cache_wavelet_decomp
+            cached_decomp = _lru_get(self._cache_wavelet_decomp, decomp_key)
+            if cached_decomp is not None:
+                residual, details = cached_decomp
             else:
-                res = AstroEngine.atrous_decompose(
-                    img, n_layers, cancel_check=lambda: self._is_cancelled(task_id)
-                )
-                if res is None:
-                    return None
-                residual, details = res
-                self._cache_wavelet_decomp = (decomp_key, residual, details)
+                # 3-канальная параллельная декомпозиция для полноразмерных кадров (>= 2 Мп)
+                if img.ndim == 3 and img.shape[2] == 3 and (img.shape[0] * img.shape[1] >= 2000000):
+                    futures = [
+                        self._thread_pool.submit(
+                            AstroEngine.atrous_decompose,
+                            img[:, :, c],
+                            n_layers,
+                            lambda: self._is_cancelled(task_id)
+                        )
+                        for c in range(3)
+                    ]
+                    results = [f.result() for f in futures]
+                    if any(r is None for r in results) or self._is_cancelled(task_id):
+                        return None
+                    residual = np.stack([r[0] for r in results], axis=-1)
+                    details = [
+                        np.stack([results[c][1][i] for c in range(3)], axis=-1)
+                        for i in range(n_layers)
+                    ]
+                else:
+                    res = AstroEngine.atrous_decompose(
+                        img, n_layers, cancel_check=lambda: self._is_cancelled(task_id)
+                    )
+                    if res is None:
+                        return None
+                    residual, details = res
+                _lru_set(self._cache_wavelet_decomp, decomp_key, (residual, details), max_size=4)
 
             if self._is_cancelled(task_id):
                 return None
 
-            out = AstroEngine.atrous_recompose(residual, details, layers)
+            out = AstroEngine.atrous_recompose(residual, details, layers[:len(details)])
             return np.clip(out, 0.0, 1.0, out=out)
 
         else:
             # Unsharp Mask: кэшируем размытую копию по (key4, radius)
             blur_key = (key4, w_l2)
-            if self._cache_unsharp_blur is not None and self._cache_unsharp_blur[0] == blur_key:
-                blurred = self._cache_unsharp_blur[1]
+            cached_blur = _lru_get(self._cache_unsharp_blur, blur_key)
+            if cached_blur is not None:
+                blurred = cached_blur
             else:
                 if img.ndim == 2:
                     blurred = gaussian_filter(img, sigma=w_l2, mode='reflect')
@@ -538,7 +618,7 @@ class PipelineWorker(QObject):
                             return None
                         planes.append(gaussian_filter(img[:, :, c], sigma=w_l2, mode='reflect'))
                     blurred = np.stack(planes, axis=-1)
-                self._cache_unsharp_blur = (blur_key, blurred)
+                _lru_set(self._cache_unsharp_blur, blur_key, blurred, max_size=4)
 
             if self._is_cancelled(task_id):
                 return None
@@ -551,65 +631,132 @@ class PipelineWorker(QObject):
             out = img + np.float32(w_l1 - 1.0) * diff
             return np.clip(out, 0.0, 1.0, out=out)
 
+    def _compute_stage2_umat(self, img: np.ndarray, key1, sigma: float,
+                             iterations: int, protect_edge: bool, task_id: int) -> Optional[np.ndarray]:
+        """Расчет деконволюции Richardson-Lucy через cv2.UMat (OpenCL GPU) с перехватом сбоев."""
+        try:
+            u_img = cv2.UMat(img)
+            u_est = cv2.UMat(np.maximum(img, np.float32(1e-6)))
+            for _ in range(iterations):
+                if self._is_cancelled(task_id):
+                    return None
+                u_conv = cv2.GaussianBlur(u_est, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REFLECT)
+                u_rel = cv2.divide(u_img, u_conv)
+                if self._is_cancelled(task_id):
+                    return None
+                u_corr = cv2.GaussianBlur(u_rel, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REFLECT)
+                u_est = cv2.multiply(u_est, u_corr)
+
+            if self._is_cancelled(task_id):
+                return None
+
+            estimate = u_est.get()
+
+            if protect_edge:
+                if self._cache_rl_edge_mask is not None and self._cache_rl_edge_mask[0] == key1:
+                    edge_mask = self._cache_rl_edge_mask[1]
+                else:
+                    ugx = cv2.Sobel(u_img, cv2.CV_32F, 1, 0, ksize=3)
+                    ugy = cv2.Sobel(u_img, cv2.CV_32F, 0, 1, ksize=3)
+                    u_grad = cv2.magnitude(ugx, ugy)
+                    u_blur = cv2.GaussianBlur(u_grad, (0, 0), sigmaX=2.0, sigmaY=2.0, borderType=cv2.BORDER_REFLECT)
+                    u_mask = cv2.multiply(u_blur, 4.0)
+                    edge_mask = np.clip(u_mask.get(), 0.0, 1.0).astype(np.float32)
+                    self._cache_rl_edge_mask = (key1, edge_mask)
+
+                weight = edge_mask * np.float32(0.85)
+                out = estimate * (np.float32(1.0) - weight) + img * weight
+                return np.clip(out, 0.0, 1.0, out=out)
+
+            return np.clip(estimate, 0.0, 1.0, out=estimate)
+        except (cv2.error, Exception):
+            # Graceful fallback: при сбое драйвера OpenCL возвращаем None для отката на CPU
+            return None
+
     def _compute_stage2(self, img: np.ndarray, key1, sigma: float,
-                        iterations: int, protect_edge: bool, task_id: int):
-        """Деконволюция Ричардсона-Люси с пошаговой отменой и дорасчетом итераций из кэша."""
+                        iterations: int, protect_edge: bool, task_id: int,
+                        prefer_umat: bool = False):
+        """Деконволюция Ричардсона-Люси с SIMD-ускорением (cv2.GaussianBlur) и дорасчетом итераций."""
+        if prefer_umat and getattr(self, '_has_ocl', False):
+            try:
+                res_umat = self._compute_stage2_umat(img, key1, sigma, iterations, protect_edge, task_id)
+                if res_umat is not None:
+                    return res_umat
+            except (cv2.error, Exception):
+                pass
+            if self._is_cancelled(task_id):
+                return None
+
         start_iter = 0
         estimate = None
 
-        if self._cache_rl_core is not None:
-            c_key1, c_sigma, c_iters, c_est = self._cache_rl_core
-            if c_key1 == key1 and c_sigma == sigma:
-                if c_iters == iterations:
-                    estimate = c_est
-                    start_iter = iterations
-                elif c_iters < iterations:
-                    # Продолжаем итерации с уже посчитанного приближения
-                    estimate = c_est.copy()
-                    start_iter = c_iters
-
-        if estimate is None:
-            estimate = np.maximum(img.copy(), np.float32(1e-6))
+        rl_core_key = (key1, round(sigma, 4))
+        cached_rl = _lru_get(self._cache_rl_core, rl_core_key)
+        if cached_rl is not None:
+            c_iters, c_est = cached_rl
+            if c_iters == iterations:
+                estimate = c_est
+                start_iter = iterations
+            elif c_iters < iterations:
+                # Продолжаем итерации с уже посчитанного приближения
+                estimate = c_est.copy()
+                start_iter = c_iters
 
         if start_iter < iterations:
-            sigma_axes = (sigma, sigma) if img.ndim == 2 else (sigma, sigma, 0.0)
-            for _ in range(start_iter, iterations):
-                if self._is_cancelled(task_id):
-                    return None
-                conv = gaussian_filter(estimate, sigma=sigma_axes, mode='reflect')
-                np.maximum(conv, np.float32(1e-12), out=conv)
-                relative_blur = img / conv
-                if self._is_cancelled(task_id):
-                    return None
-                corr = gaussian_filter(relative_blur, sigma=sigma_axes, mode='reflect')
-                estimate *= corr
+            # 3-канальная параллельная деконволюция для полноразмерных кадров (>= 2 Мп)
+            if img.ndim == 3 and img.shape[2] == 3 and (img.shape[0] * img.shape[1] >= 2000000):
+                def _deconv_ch(c: int):
+                    ch_img = img[:, :, c]
+                    est = estimate[:, :, c].copy() if estimate is not None else np.maximum(ch_img.copy(), np.float32(1e-6))
+                    for _ in range(start_iter, iterations):
+                        if self._is_cancelled(task_id):
+                            return None
+                        conv = cv2.GaussianBlur(est, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REFLECT)
+                        np.maximum(conv, np.float32(1e-12), out=conv)
+                        rel = ch_img / conv
+                        if self._is_cancelled(task_id):
+                            return None
+                        corr = cv2.GaussianBlur(rel, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REFLECT)
+                        est *= corr
+                    return est
 
-            self._cache_rl_core = (key1, sigma, iterations, estimate)
+                futures = [self._thread_pool.submit(_deconv_ch, c) for c in range(3)]
+                results = [f.result() for f in futures]
+                if any(r is None for r in results) or self._is_cancelled(task_id):
+                    return None
+                estimate = np.stack(results, axis=-1)
+            else:
+                if estimate is None:
+                    estimate = np.maximum(img.copy(), np.float32(1e-6))
+                for _ in range(start_iter, iterations):
+                    if self._is_cancelled(task_id):
+                        return None
+                    conv = cv2.GaussianBlur(estimate, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REFLECT)
+                    np.maximum(conv, np.float32(1e-12), out=conv)
+                    relative_blur = img / conv
+                    if self._is_cancelled(task_id):
+                        return None
+                    corr = cv2.GaussianBlur(relative_blur, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REFLECT)
+                    estimate *= corr
+
+            _lru_set(self._cache_rl_core, rl_core_key, (iterations, estimate), max_size=4)
 
         if self._is_cancelled(task_id):
             return None
 
         if protect_edge:
-            if self._cache_rl_edge_mask is not None and self._cache_rl_edge_mask[0] == key1:
-                edge_mask = self._cache_rl_edge_mask[1]
+            cached_edge = _lru_get(self._cache_rl_edge_mask, key1)
+            if cached_edge is not None:
+                edge_mask = cached_edge
             else:
-                if img.ndim == 2:
-                    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
-                    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
-                    grad = np.hypot(gx, gy)
-                    edge_mask = np.clip(gaussian_filter(grad, sigma=2.0) * 4.0, 0.0, 1.0).astype(np.float32)
-                else:
-                    masks = []
-                    for c in range(img.shape[2]):
-                        if self._is_cancelled(task_id):
-                            return None
-                        plane = img[:, :, c]
-                        gx = cv2.Sobel(plane, cv2.CV_32F, 1, 0, ksize=3)
-                        gy = cv2.Sobel(plane, cv2.CV_32F, 0, 1, ksize=3)
-                        grad = np.hypot(gx, gy)
-                        masks.append(np.clip(gaussian_filter(grad, sigma=2.0) * 4.0, 0.0, 1.0).astype(np.float32))
-                    edge_mask = np.stack(masks, axis=-1)
-                self._cache_rl_edge_mask = (key1, edge_mask)
+                gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+                gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+                grad = np.hypot(gx, gy)
+                edge_mask = np.clip(
+                    cv2.GaussianBlur(grad, (0, 0), sigmaX=2.0, sigmaY=2.0, borderType=cv2.BORDER_REFLECT) * 4.0,
+                    0.0, 1.0
+                ).astype(np.float32)
+                _lru_set(self._cache_rl_edge_mask, key1, edge_mask, max_size=4)
 
             weight = edge_mask * np.float32(0.85)
             out = estimate * (np.float32(1.0) - weight) + img * weight
