@@ -311,9 +311,12 @@ class HoverDwellWheelMixin:
         if hasattr(self, '_hover_dwell_timer'):
             self._hover_dwell_timer.stop()
         self._wheel_enabled = False
-        super().leaveEvent(event)
+        if event is not None:
+            super().leaveEvent(event)
 
     def mousePressEvent(self, event):
+        if not hasattr(self, '_hover_dwell_timer'):
+            self._init_hover_dwell()
         self._wheel_enabled = True
         self.setFocus()
         super().mousePressEvent(event)
@@ -387,10 +390,13 @@ class PlanetarySlider(HoverDwellWheelMixin, QSlider):
     def mousePressEvent(self, event):
         if not self.isEnabled():
             return
+        if not hasattr(self, '_hover_dwell_timer'):
+            self._init_hover_dwell()
         self._wheel_enabled = True
         self.setFocus()
         if event.button() == Qt.MouseButton.LeftButton:
-            self._update_from_mouse(event.pos().x())
+            pos_x = event.position().x() if hasattr(event, 'position') else event.pos().x()
+            self._update_from_mouse(pos_x)
             event.accept()
         super().mousePressEvent(event)
 
@@ -405,7 +411,8 @@ class PlanetarySlider(HoverDwellWheelMixin, QSlider):
         if not self.isEnabled():
             return
         if event.buttons() & Qt.MouseButton.LeftButton:
-            self._update_from_mouse(event.pos().x())
+            pos_x = event.position().x() if hasattr(event, 'position') else event.pos().x()
+            self._update_from_mouse(pos_x)
             event.accept()
         super().mouseMoveEvent(event)
 
@@ -1442,6 +1449,7 @@ class CollapsibleInsertBox(QWidget):
 
         if self.header.dry_wet_ctrl is not None:
             self.header.dry_wet_ctrl.valueChanged.connect(self._on_dry_wet_value_changed)
+            self.header.dry_wet_ctrl.sliderReleased.connect(self.state_committed.emit)
 
         self.content_widget = QFrame()
         self.content_widget.setObjectName("InsertContent")
@@ -1473,7 +1481,6 @@ class CollapsibleInsertBox(QWidget):
     def _on_dry_wet_value_changed(self, val: int):
         self.dry_wet_changed.emit(val)
         self.slider_changed.emit()
-        self.state_committed.emit()
 
     def get_dry_wet_ratio(self) -> float:
         if self.header.dry_wet_ctrl is not None:

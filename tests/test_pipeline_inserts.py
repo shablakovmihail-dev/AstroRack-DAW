@@ -34,6 +34,20 @@ def test_inserts_disabled_are_noop():
     assert np.array_equal(out, img)
 
 
+def test_insert3_tone_applied_and_cached():
+    img = make_moon(256)
+    w = _worker(img)
+    p3 = dict(BASE, insert3_enabled=True, tc_black=0.05, tc_gamma=1.2, tc_contrast=1.1)
+    o3 = _run(w, p3)
+    assert o3.shape == img.shape and not np.array_equal(o3, img)
+    # Повторный запрос — выдача из LRU-кэша стадии 3
+    assert _run(w, p3) is o3
+    # Проверка экстремальных значений (black >= 1.0, gamma <= 0, contrast <= 0, nan)
+    p3_edge = dict(BASE, insert3_enabled=True, tc_black=1.5, tc_gamma=0.0, tc_contrast=0.0)
+    o3_edge = _run(w, p3_edge)
+    assert o3_edge.shape == img.shape and not np.isnan(o3_edge).any()
+
+
 def test_insert5_and_insert6_applied_and_cached():
     img = make_moon(512)
     w = _worker(img)

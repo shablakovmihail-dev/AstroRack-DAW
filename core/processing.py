@@ -246,19 +246,26 @@ class AstroEngine:
     @staticmethod
     def tone_and_contrast(img: np.ndarray, black_level: float, gamma: float, contrast: float) -> np.ndarray:
         """Отсечка фона, гамма средних тонов и параметрическая S-Curve контраста."""
-        denom = max(1.0 - black_level, 1e-4)
-        out = np.clip((img - black_level) / denom, 0.0, 1.0)
+        # Защита от некорректных численных значений (NaN, Inf, деление на ноль)
+        black_val = float(np.clip(black_level if np.isfinite(black_level) else 0.0, 0.0, 0.999))
+        gamma_val = float(np.clip(gamma if np.isfinite(gamma) else 1.0, 0.05, 10.0))
+        contrast_val = float(np.clip(contrast if np.isfinite(contrast) else 1.0, 0.05, 10.0))
 
-        if abs(gamma - 1.0) > 1e-3 and gamma > 0.0:
-            out = np.power(out, 1.0 / gamma)
+        denom = max(1.0 - black_val, 1e-4)
+        out = np.clip((img - black_val) / denom, 0.0, 1.0)
 
-        if abs(contrast - 1.0) > 1e-3:
+        if abs(gamma_val - 1.0) > 1e-3:
+            out = np.power(out, 1.0 / gamma_val)
+
+        if abs(contrast_val - 1.0) > 1e-3:
             eps = 1e-7
             out_clamped = np.clip(out, eps, 1.0 - eps)
-            k = contrast
-            out = (out_clamped ** k) / ((out_clamped ** k) + ((1.0 - out_clamped) ** k))
+            k = contrast_val
+            denom_c = (out_clamped ** k) + ((1.0 - out_clamped) ** k)
+            denom_c = np.maximum(denom_c, 1e-12)
+            out = (out_clamped ** k) / denom_c
 
-        return np.clip(out, 0.0, 1.0)
+        return np.nan_to_num(np.clip(out, 0.0, 1.0), nan=0.0, posinf=1.0, neginf=0.0)
 
     @staticmethod
     def rotate_90_cw(img: np.ndarray) -> np.ndarray:

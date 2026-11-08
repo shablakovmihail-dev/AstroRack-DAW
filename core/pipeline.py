@@ -25,21 +25,6 @@ def _lru_set(d: OrderedDict, key, value, max_size: int = 4):
         d.popitem(last=False)
 
 
-def _get_free_cache_buffer(d: OrderedDict, shape, dtype, max_size: int = 4) -> Optional[np.ndarray]:
-    """Возвращает свободный буфер из вытесняемой записи LRU-кэша для переиспользования памяти."""
-    if len(d) >= max_size:
-        oldest_key = next(iter(d))
-        oldest_val = d[oldest_key]
-        if (
-            isinstance(oldest_val, np.ndarray)
-            and oldest_val.shape == shape
-            and oldest_val.dtype == dtype
-            and oldest_val.flags['C_CONTIGUOUS']
-        ):
-            return oldest_val
-    return None
-
-
 def blend_dry_wet(dry_img: np.ndarray, wet_img: np.ndarray, wet_ratio: float = 1.0,
                   dst: Optional[np.ndarray] = None) -> np.ndarray:
     """Универсальная быстрая функция параллельного линейного подмешивания Dry/Wet (float32/uint8).
@@ -164,6 +149,8 @@ class PipelineWorker(QObject):
         self._cache_stage2_wet = OrderedDict()      # core_key2 -> wet_img
         self._cache_stage2 = OrderedDict()          # key2 -> img_after_insert2
 
+        self._cache_stage3 = None                   # (key3, stage3_img)
+        self._cache_stage3_active = None            # (full_key3, stage3_img)
         self._stage_cache = {}                      # slot -> OrderedDict(key -> img)
 
     def cancel_current(self):
@@ -345,8 +332,7 @@ class PipelineWorker(QObject):
                     _lru_set(self._cache_stage1_wet, core_key1, stage1_wet, max_size=4)
 
                 # Параллельное подмешивание Dry/Wet
-                dst_buf1 = _get_free_cache_buffer(self._cache_stage1, stage1_wet.shape, stage1_wet.dtype)
-                stage1_img = blend_dry_wet(stage4_img, stage1_wet, w_wet_ratio, dst=dst_buf1)
+                stage1_img = blend_dry_wet(stage4_img, stage1_wet, w_wet_ratio)
                 _lru_set(self._cache_stage1, key1, stage1_img, max_size=4)
 
         if self._is_cancelled(task_id):
@@ -374,14 +360,14 @@ class PipelineWorker(QObject):
             full_key2 = (full_core_key2, round(rl_wet_ratio, 4))
 
             cached_s2 = _lru_get(self._cache_stage2, full_key2)
-            if cached_s2 is None:
+            if cached_s2 is None and (is_preview or eff_iters == rl_iters):
                 cached_s2 = _lru_get(self._cache_stage2, key2)
 
             if cached_s2 is not None:
                 stage2_img = cached_s2
             else:
                 stage2_wet = _lru_get(self._cache_stage2_wet, full_core_key2)
-                if stage2_wet is None:
+                if stage2_wet is None and (is_preview or eff_iters == rl_iters):
                     stage2_wet = _lru_get(self._cache_stage2_wet, core_key2)
                 if stage2_wet is None:
                     stage2_wet = self._compute_stage2(
@@ -394,8 +380,7 @@ class PipelineWorker(QObject):
                     _lru_set(self._cache_stage2_wet, save_core_key, stage2_wet, max_size=4)
 
                 # Параллельное подмешивание Dry/Wet
-                dst_buf2 = _get_free_cache_buffer(self._cache_stage2, stage2_wet.shape, stage2_wet.dtype)
-                stage2_img = blend_dry_wet(stage1_img, stage2_wet, rl_wet_ratio, dst=dst_buf2)
+                stage2_img = blend_dry_wet(stage1_img, stage2_wet, rl_wet_ratio)
                 save_key2 = full_key2 if (not is_preview or eff_iters == rl_iters) else key2
                 _lru_set(self._cache_stage2, save_key2, stage2_img, max_size=4)
 
@@ -419,22 +404,29 @@ class PipelineWorker(QObject):
             key3 = (key2, 'bypass')
             stage3_img = stage2_img
         else:
-            key3 = (key2, tc_black, tc_gamma, tc_contrast, is_preview)
-            full_key3 = (key2, tc_black, tc_gamma, tc_contrast, False)
-            if self._cache_stage3 is not None and self._cache_stage3[0] in (key3, full_key3):
-                stage3_img = self._cache_stage3[1]
-            elif self._cache_stage3_active is not None and self._cache_stage3_active[0] == full_key3:
-                stage3_img = self._cache_stage3_active[1]
+            core_key3 = (key2, tc_black, tc_gamma, tc_contrast)
+            key3 = (core_key3, is_preview)
+            full_key3 = (core_key3, False)
+
+            slot3 = self._stage_cache.setdefault('stage3', OrderedDict())
+            cached3 = _lru_get(slot3, key3)
+            if cached3 is None:
+                cached3 = _lru_get(slot3, full_key3)
+
+            if cached3 is not None:
+                stage3_img = cached3
             else:
                 stage3_img = self._compute_stage3(
                     stage2_img, tc_black, tc_gamma, tc_contrast, is_preview, task_id
                 )
                 if stage3_img is None:
                     return None
-                if not is_preview:
-                    self._cache_stage3_active = (full_key3, stage3_img)
+                save_key3 = full_key3 if not is_preview else key3
+                _lru_set(slot3, save_key3, stage3_img, max_size=4)
 
         self._cache_stage3 = (key3, stage3_img)
+        if not is_preview:
+            self._cache_stage3_active = (key3 if ins3_neutral else full_key3, stage3_img)
 
         if self._is_cancelled(task_id):
             return None
@@ -472,8 +464,7 @@ class PipelineWorker(QObject):
                 if stage5_wet is None:
                     return None
                 # Параллельное подмешивание Dry/Wet
-                dst_buf5 = _get_free_cache_buffer(slot5, stage5_wet.shape, stage5_wet.dtype)
-                stage5_img = blend_dry_wet(stage3_img, stage5_wet, lc_wet_ratio, dst=dst_buf5)
+                stage5_img = blend_dry_wet(stage3_img, stage5_wet, lc_wet_ratio)
                 _lru_set(slot5, key5, stage5_img, max_size=4)
 
         # =====================================================================
@@ -514,8 +505,7 @@ class PipelineWorker(QObject):
                 )
                 if stage6_wet is None:
                     return None
-                dst_buf6 = _get_free_cache_buffer(slot6, stage6_wet.shape, stage6_wet.dtype)
-                stage6_img = blend_dry_wet(stage5_img, stage6_wet, cs_wet_ratio, dst=dst_buf6)
+                stage6_img = blend_dry_wet(stage5_img, stage6_wet, cs_wet_ratio)
                 _lru_set(slot6, key6, stage6_img, max_size=4)
 
         # =====================================================================
@@ -770,12 +760,18 @@ class PipelineWorker(QObject):
         if self._is_cancelled(task_id):
             return None
 
+        # Защита от деления на ноль, отрицательных значений и NaN/Inf
+        black_level = float(np.clip(black_level if np.isfinite(black_level) else 0.0, 0.0, 0.999))
+        gamma = float(np.clip(gamma if np.isfinite(gamma) else 1.0, 0.05, 10.0))
+        contrast = float(np.clip(contrast if np.isfinite(contrast) else 1.0, 0.05, 10.0))
+
         has_non_linear = abs(gamma - 1.0) > 1e-3 or abs(contrast - 1.0) > 1e-3
         # Для быстрых превью или крупных кадров с нелинейной гаммой/контрастом используем 16-bit LUT
         if has_non_linear and (is_preview or img.size >= 400000):
             lut_in = np.linspace(0.0, 1.0, 65536, dtype=np.float32)
             lut_out = AstroEngine.tone_and_contrast(lut_in, black_level, gamma, contrast).astype(np.float32)
-            idx = np.clip(img * np.float32(65535.0), 0.0, 65535.0).astype(np.uint16)
+            safe_img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+            idx = np.clip(safe_img * np.float32(65535.0), 0.0, 65535.0).astype(np.uint16)
             return lut_out[idx]
 
         return AstroEngine.tone_and_contrast(
