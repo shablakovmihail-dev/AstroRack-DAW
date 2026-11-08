@@ -190,6 +190,7 @@ class AstroRackWindow(QMainWindow):
         self._roi_busy = False
 
         self._setup_ui()
+        sound_engine.init_audio()
         self._apply_dark_theme()
         self.initUI()
 

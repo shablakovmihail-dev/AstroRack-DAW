@@ -29,6 +29,10 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
+    # Инициализация звукового движка строго после создания экземпляра QApplication
+    from core.sound import sound_engine
+    sound_engine.init_audio()
+
     # Установка иконки для всего приложения
     ico_path = get_resource_path(os.path.join("assets", "app_icon.ico"))
     icon_256 = get_resource_path(os.path.join("assets", "icons", "icon_256x256.png"))

@@ -8,7 +8,7 @@ import io
 import wave
 import threading
 import numpy as np
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QSettings, QIODevice
 from utils.file_io import get_resource_path
 
 try:
@@ -17,6 +17,26 @@ try:
 except ImportError:
     winsound = None
     _HAS_WINSOUND = False
+
+
+class _SilenceIODevice(QIODevice):
+    """Генератор тишины с нулевой аллокацией для постоянного удержания WASAPI-сессии (Audio Keep-Alive)."""
+    _ZERO_CHUNK = b'\x00' * 8192
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.open(QIODevice.OpenModeFlag.ReadOnly)
+
+    def isSequential(self) -> bool:
+        return True
+
+    def readData(self, maxlen: int) -> bytes:
+        if maxlen <= len(self._ZERO_CHUNK):
+            return self._ZERO_CHUNK[:maxlen]
+        return b'\x00' * maxlen
+
+    def bytesAvailable(self) -> int:
+        return len(self._ZERO_CHUNK) + super().bytesAvailable()
 
 
 class SoundEngine:
@@ -62,9 +82,24 @@ class SoundEngine:
             except Exception:
                 pass
 
-        # Инициализация QSoundEffect как постоянных атрибутов класса
+        # Инициализация QSoundEffect как постоянных атрибутов класса (ленивая)
         self._fx_relay = None
         self._fx_shutter = None
+        self._qsound_initialized = False
+        self._keep_alive_sink = None
+        self._keep_alive_gen = None
+
+    def init_audio(self):
+        """Инициализация QSoundEffect и Audio Keep-Alive строго после создания экземпляра QApplication."""
+        if getattr(self, '_qsound_initialized', False):
+            if self._enabled:
+                self._start_keep_alive()
+            return
+        from PyQt6.QtWidgets import QApplication
+        if QApplication.instance() is None:
+            return  # QApplication еще не создан, откладываем инициализацию
+
+        self._qsound_initialized = True
         try:
             from PyQt6.QtMultimedia import QSoundEffect
             from PyQt6.QtCore import QUrl
@@ -78,6 +113,50 @@ class SoundEngine:
                 self._fx_shutter.setVolume(1.0)
         except Exception:
             pass
+
+        if self._enabled:
+            self._start_keep_alive()
+
+    def _start_keep_alive(self):
+        """Запуск фонового аудиопотока тишины для предотвращения WASAPI Endpoint Standby."""
+        if self._keep_alive_sink is not None:
+            return
+        from PyQt6.QtWidgets import QApplication
+        if QApplication.instance() is None:
+            return
+
+        try:
+            from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
+            device = QMediaDevices.defaultAudioOutput()
+            if device.isNull():
+                return
+            fmt = QAudioFormat()
+            fmt.setSampleRate(44100)
+            fmt.setChannelCount(1)
+            fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+
+            self._keep_alive_gen = _SilenceIODevice()
+            self._keep_alive_sink = QAudioSink(device, fmt)
+            self._keep_alive_sink.setBufferSize(4096)
+            self._keep_alive_sink.start(self._keep_alive_gen)
+        except Exception:
+            self._keep_alive_sink = None
+            self._keep_alive_gen = None
+
+    def _stop_keep_alive(self):
+        """Остановка фонового потока тишины (при Mute или закрытии программы)."""
+        if self._keep_alive_sink is not None:
+            try:
+                self._keep_alive_sink.stop()
+            except Exception:
+                pass
+            self._keep_alive_sink = None
+        if self._keep_alive_gen is not None:
+            try:
+                self._keep_alive_gen.close()
+            except Exception:
+                pass
+            self._keep_alive_gen = None
 
     def _ensure_sound_files(self):
         """Генерирует файлы коротких эффектов высокого качества."""
@@ -148,6 +227,10 @@ class SoundEngine:
         """Устанавливает и сохраняет активность звуковых эффектов."""
         self._enabled = bool(enabled)
         self.settings.setValue("ui_sounds_enabled", self._enabled)
+        if self._enabled:
+            self._start_keep_alive()
+        else:
+            self._stop_keep_alive()
 
     def toggle_enabled(self) -> bool:
         """Переключает режим активности звуков (Mute / Unmute)."""
@@ -155,13 +238,24 @@ class SoundEngine:
         return self._enabled
 
     def _play(self, wav_bytes: bytes, wav_path: str, qsound_effect=None):
-        """Безопасное асинхронное воспроизведение звука."""
+        """Безопасное асинхронное воспроизведение звука с мгновенным WASAPI-откликом."""
         if self.sound_muted:
             return
 
-        # 1. Приоритетный способ под Windows — стандартный модуль winsound
+        self.init_audio()
         played = False
-        if _HAS_WINSOUND and winsound is not None:
+
+        # 1. Приоритетный способ — аппаратно-микшируемый QSoundEffect поверх активной WASAPI-сессии
+        fx = qsound_effect or (self._fx_relay if 'relay' in wav_path else self._fx_shutter)
+        if fx is not None:
+            try:
+                fx.play()
+                played = True
+            except Exception:
+                played = False
+
+        # 2. Fallback под Windows — winsound (если QSoundEffect недоступен)
+        if not played and _HAS_WINSOUND and winsound is not None:
             try:
                 winsound.PlaySound(wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
                 played = True
@@ -173,21 +267,16 @@ class SoundEngine:
                 except Exception:
                     pass
 
-        # 2. QSoundEffect как дополнение/альтернатива
-        if not played and qsound_effect is not None:
-            try:
-                qsound_effect.play()
-            except Exception:
-                pass
-
     def play_relay_click(self):
         """Воспроизводит аналоговый щелчок студийного реле компрессора (Master Bypass)."""
         print("[Sound] Playing relay click...")
+        self.init_audio()
         self._play(self._relay_bytes, self._relay_path, self._fx_relay)
 
     def play_shutter(self):
         """Воспроизводит мягкий звук затвора камеры/линзы (успешный экспорт)."""
         print("[Sound] Playing camera shutter...")
+        self.init_audio()
         self._play(self._shutter_bytes, self._shutter_path, self._fx_shutter)
 
 
