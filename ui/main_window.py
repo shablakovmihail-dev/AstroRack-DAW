@@ -239,37 +239,40 @@ class AstroRackWindow(QMainWindow):
         top_bar_widget = QWidget()
         top_bar_widget.setFixedHeight(48)
         top_bar = QHBoxLayout(top_bar_widget)
-        top_bar.setContentsMargins(0, 6, 8, 6)
+        top_bar.setContentsMargins(0, 0, 8, 0)
         top_bar.setSpacing(6)
 
         def create_v_divider():
             line = QFrame()
             line.setFrameShape(QFrame.Shape.VLine)
             line.setFrameShadow(QFrame.Shadow.Plain)
-            line.setStyleSheet("color: #2c2c38; background-color: #2c2c38; width: 1px; margin: 4px 0px;")
+            line.setStyleSheet("color: #2c2c38; background-color: #2c2c38; width: 1px; margin: 10px 0px;")
             return line
 
-        # BRAND LOGO (Ширина контейнера СТРОГО 48px = ширине вертикального левого тулбара)
+        # BRAND LOGO (Контейнер 48x48px: по ширине левого тулбара и по высоте верхнего бара)
         self.logo_container = QWidget()
-        self.logo_container.setFixedWidth(48)
-        self.logo_container.setFixedHeight(36)
+        self.logo_container.setFixedSize(48, 48)
         logo_layout = QHBoxLayout(self.logo_container)
         logo_layout.setContentsMargins(0, 0, 0, 0)
         logo_layout.setSpacing(0)
         logo_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.lbl_logo = QLabel()
-        self.lbl_logo.setFixedSize(32, 32)
+        self.lbl_logo.setFixedSize(48, 48)
         self.lbl_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_logo.setStyleSheet("margin: 0; padding: 0; background: transparent;")
         self.lbl_logo.setToolTip("AstroRack DAW v8.3.6")
-        icon_32_path = get_resource_path(os.path.join("assets", "icons", "icon_32x32.png"))
-        if os.path.isfile(icon_32_path):
-            self.lbl_logo.setPixmap(QPixmap(icon_32_path).scaled(30, 30, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        else:
-            icon_24_path = get_resource_path(os.path.join("assets", "icons", "icon_24x24.png"))
-            if os.path.isfile(icon_24_path):
-                self.lbl_logo.setPixmap(QPixmap(icon_24_path).scaled(28, 28, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        self.lbl_logo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_logo.mousePressEvent = lambda event: self._show_about_dialog() if event.button() == Qt.MouseButton.LeftButton else None
+        icon_path = get_resource_path(os.path.join("assets", "icons", "icon_128x128.png"))
+        if not os.path.isfile(icon_path):
+            icon_path = get_resource_path(os.path.join("assets", "icons", "icon_48x48.png"))
+        if not os.path.isfile(icon_path):
+            icon_path = get_resource_path(os.path.join("assets", "icons", "icon_32x32.png"))
+        if os.path.isfile(icon_path):
+            self.lbl_logo.setPixmap(
+                QPixmap(icon_path).scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            )
         logo_layout.addWidget(self.lbl_logo)
         top_bar.addWidget(self.logo_container)
 
@@ -1168,6 +1171,8 @@ class AstroRackWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, 'canvas') and hasattr(self.canvas, '_update_overlay_pos'):
+            self.canvas._update_overlay_pos()
         if getattr(self, '_panel_collapsed', False):
             self._set_panel_width(16)
         else:

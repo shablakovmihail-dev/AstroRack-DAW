@@ -1110,15 +1110,19 @@ class AstroCanvas(QGraphicsView):
         self._update_welcome_pos()
         self._update_measurement_hud_pos()
 
+    def scrollContentsBy(self, dx: int, dy: int):
+        super().scrollContentsBy(dx, dy)
+        self._update_overlay_pos()
+
     def _update_measurement_hud_pos(self):
         # Панель измерений зафиксирована в нижней части контейнера под холстом
         pass
 
     def _update_overlay_pos(self):
-        if hasattr(self, 'status_overlay'):
+        if hasattr(self, 'status_overlay') and self.status_overlay is not None:
             self.status_overlay.adjustSize()
             h = self.status_overlay.height()
-            self.status_overlay.move(12, max(0, self.viewport().height() - h - 12))
+            self.status_overlay.move(16, max(0, self.viewport().height() - h - 16))
 
     def _update_welcome_pos(self):
         if hasattr(self, 'welcome_widget') and self.welcome_widget.isVisible():
@@ -1146,6 +1150,7 @@ class AstroCanvas(QGraphicsView):
         self._scene.setSceneRect(self._item.boundingRect())
         if not self._item.boundingRect().isEmpty():
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._update_overlay_pos()
         self.zoomChanged.emit(self.get_current_zoom_str())
         self.viewport().update()
 
@@ -3114,6 +3119,7 @@ class AstroCanvas(QGraphicsView):
 
         factor = 1.15 if event.angleDelta().y() > 0 else (1.0 / 1.15)
         self.scale(factor, factor)
+        self._update_overlay_pos()
         self.zoomChanged.emit(self.get_current_zoom_str())
         self.viewport().update()
 
