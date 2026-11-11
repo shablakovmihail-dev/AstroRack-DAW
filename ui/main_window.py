@@ -73,7 +73,7 @@ class StatusProxy:
 class AstroRackWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AstroRack DAW v8.3.6 — Lunar & Planetary Processor")
+        self.setWindowTitle("AstroRack DAW v8.7.6 — Lunar & Planetary Processor")
         self.resize(1500, 930)
         self.setAcceptDrops(True)
 
@@ -261,7 +261,7 @@ class AstroRackWindow(QMainWindow):
         self.lbl_logo.setFixedSize(48, 48)
         self.lbl_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_logo.setStyleSheet("margin: 0; padding: 0; background: transparent;")
-        self.lbl_logo.setToolTip("AstroRack DAW v8.3.6")
+        self.lbl_logo.setToolTip("AstroRack DAW v8.7.6")
         self.lbl_logo.setCursor(Qt.CursorShape.PointingHandCursor)
         self.lbl_logo.mousePressEvent = lambda event: self._show_about_dialog() if event.button() == Qt.MouseButton.LeftButton else None
         icon_path = get_resource_path(os.path.join("assets", "icons", "icon_128x128.png"))

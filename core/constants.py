@@ -1,6 +1,7 @@
 """Астрономические константы и справочные данные для AstroRack DAW."""
 
 from typing import Dict
+from version import __version__, VERSION
 
 # Справочник эталонных лунных кратеров с физическими диаметрами в километрах
 LUNAR_CRATERS: Dict[str, float] = {

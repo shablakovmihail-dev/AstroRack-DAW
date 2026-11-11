@@ -13,7 +13,7 @@ from version import (
 CONFIG = {
     "app_name": APP_NAME,
     "version": VERSION,
-    "version_tuple": (8, 3, 6),
+    "version_tuple": (8, 7, 6),
     "window_title": APP_FULL_TITLE,
     "app_subtitle": APP_SUBTITLE,
     "app_description": APP_DESCRIPTION,

@@ -1,4 +1,4 @@
-# AstroRack DAW v8.3.6 🪐🎛️
+# AstroRack DAW v8.7.6 🪐🎛️
 
 > **Desktop Digital Audio Workstation-style Lunar & Planetary Astrophotography Post-Processor.**
 
@@ -48,6 +48,10 @@ Instead of opaque, destructive one-click filters, AstroRack DAW gives astrophoto
 
 - 🔭 **Live Pixel Telemetry & Probing**:
   - High-precision 32-bit float coordinate inspector tracking RGB values, luminance, signal levels, and zoom ratios.
+
+- 📐 **Lunar Crater Calibration & Unified Metric Scale (`scale_km_per_px`)**:
+  - Direct physical calibration against landmark lunar craters (Tycho, Copernicus, Plato, Clavius).
+  - Consistent metric scaling across lunar rulers, crater profiling ellipses, and true surface distance calculations.
 
 ---
 
